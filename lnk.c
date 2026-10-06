@@ -576,28 +576,40 @@ static void apply_rela(Obj *o, int ri) {
     memcpy(&r, raw + k * sizeof(Rela), sizeof r);
     uint32_t type = R_TYPE(r.r_info);
     if (type == R_X86_64_NONE) continue;
-    uint64_t width = 4;  // no 8-byte form is implemented yet
+    uint64_t width = (type == R_X86_64_64 || type == R_X86_64_PC64) ? 8 : 4;
     if (r.r_offset > seclen || width > seclen - r.r_offset)
       die("%s: relocation at offset %llu runs past the end of '%s'", o->path,
           (unsigned long long)r.r_offset, where);
 
     uint64_t S = symval(o, R_SYM(r.r_info), where);
     int64_t A = r.r_addend;
-    (void)S; (void)A;
     // P is the address of the relocated field *in the output*, which is only
     // knowable after layout -- hence the ordering of the passes above.
     uint64_t P = base_addr + r.r_offset;
     uint64_t at_off = base_off + r.r_offset;
     const char *nm = symname(o, R_SYM(r.r_info));
-    // Nothing is applied yet, so the switch below only ever reaches its default.
-    (void)S; (void)A; (void)P; (void)at_off;
 
     switch (type) {
+    case R_X86_64_PC32: {
+      // S + A - P. A call or RIP-relative access encodes the distance from the
+      // *end* of the instruction to the target; the assembler puts that -4 (or
+      // whatever the trailing-byte count is) into the addend, so the linker
+      // just subtracts the address of the field itself. Get the sign of this
+      // backwards and every call jumps to roughly twice the wrong distance.
+      //
+      int64_t v = (int64_t)(S + (uint64_t)A - P);
+      if (v < INT32_MIN || v > INT32_MAX)
+        die("%s: %s against '%s' does not fit in 32 bits (displacement %lld); "
+            "the output image is larger than a 2GB PC-relative branch can reach",
+            o->path, reloc_name(type), nm, (long long)v);
+      put32(at_off, (uint32_t)(int32_t)v);
+      break;
+    }
     default:
       // Refusing beats emitting a plausible wrong address: a binary that links
       // cleanly and then jumps into nowhere costs far more to debug.
       die("%s: unsupported relocation type %u (%s) against '%s' in '%s'.\n"
-          "       lnk implements no relocation type at all yet. "
+          "       lnk implements R_X86_64_PC32 only. "
           "GOT/PLT/TLS forms need a dynamic linker's machinery (see PLAN.md); "
           "refusing rather than emitting a wrong address.",
           o->path, type, reloc_name(type), nm, where);
