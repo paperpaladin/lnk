@@ -1,5 +1,5 @@
 // Entry object. Talks to the kernel directly and pulls everything else in from
-// lib.o, so every interesting reference is cross-object.
+// lib.o and asm.o, so every interesting reference is cross-object.
 extern int counter;
 extern const char msg[];
 extern int bigbuf[];
@@ -7,6 +7,7 @@ int add(int a, int b);
 int lib_sum(void);
 int bss_is_zero(void);
 int say(void);
+int asm_probe(void);
 
 long wr(int fd, const void *p, long n) {
   long r;
@@ -35,7 +36,8 @@ void _start(void) {
   if (!bss_is_zero()) { wr(2, "bss dirty\n", 10); sys_exit(1); }
   bigbuf[7] = 26;        // cross-object .bss write
   int r = add(counter, 2);   // cross-object call reading cross-object .data: 7
-  r += lib_sum();            // 26, so 33
+  r += lib_sum();            // 26
+  r += asm_probe();          // 9
   putnum(r);
   sys_exit(r);
 }

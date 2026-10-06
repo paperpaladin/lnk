@@ -590,6 +590,9 @@ static void apply_rela(Obj *o, int ri) {
     const char *nm = symname(o, R_SYM(r.r_info));
 
     switch (type) {
+    case R_X86_64_64:
+      put64(at_off, S + (uint64_t)A);
+      break;
     case R_X86_64_PC32:
     case R_X86_64_PLT32: {
       // S + A - P. A call or RIP-relative access encodes the distance from the
@@ -631,7 +634,7 @@ static void apply_rela(Obj *o, int ri) {
       // Refusing beats emitting a plausible wrong address: a binary that links
       // cleanly and then jumps into nowhere costs far more to debug.
       die("%s: unsupported relocation type %u (%s) against '%s' in '%s'.\n"
-          "       lnk implements R_X86_64_PC32, PLT32, 32 and 32S only. "
+          "       lnk implements R_X86_64_64, PC32, PLT32, 32 and 32S only. "
           "GOT/PLT/TLS forms need a dynamic linker's machinery (see PLAN.md); "
           "refusing rather than emitting a wrong address.",
           o->path, type, reloc_name(type), nm, where);

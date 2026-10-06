@@ -55,16 +55,18 @@ build t/lib.o    t/lib.c    || exit 1
 build t/weak.o   t/weak.c   || exit 1
 build t/weak2.o  t/weak2.c  || exit 1
 
+gcc -c -o t/asm.o t/asm.s || no "gcc -c t/asm.s"
+
 # --------------------------------------------------------- 1. the kernel runs it
 runs "single object, raw syscall _start" 42 "" t/exit42.o
 
 runs "a call across two objects" 42 "" t/tmp.callA.o t/tmp.callB.o
 runs "the same two in reverse order" 42 "" t/tmp.callB.o t/tmp.callA.o
 
-runs "two objects, cross-object calls and data" 33 "hello from lib
-33" t/main.o t/lib.o
-runs "the same two in reverse order" 33 "hello from lib
-33" t/lib.o t/main.o
+runs "three objects, cross-object calls and data" 42 "hello from lib
+42" t/main.o t/lib.o t/asm.o
+runs "the same three in reverse order" 42 "hello from lib
+42" t/asm.o t/lib.o t/main.o
 runs "local/weak/strong resolution" 13 "" t/weak.o t/weak2.o
 runs "weak twin seen before the strong one" 13 "" t/weak2.o t/weak.o
 
