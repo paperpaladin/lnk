@@ -155,6 +155,25 @@ struct Obj {
 static Osec out[64];
 static int nout;
 
+// A resolved definition. shortcut: linear search, O(refs * defs). Fine for the
+// handful of objects a static link of a freestanding program involves; swap in
+// a hash table when linking glibc's archive members makes it matter.
+typedef struct {
+  const char *name;
+  Obj *o;
+  uint32_t idx;  // index into o->sym
+  int weak;
+} Gsym;
+
+static Gsym *gsym;
+static int ngsym, cgsym;
+
+static Gsym *gfind(const char *name) {
+  for (int i = 0; i < ngsym; i++)
+    if (!strcmp(gsym[i].name, name)) return &gsym[i];
+  return NULL;
+}
+
 static uint64_t align_up(uint64_t v, uint64_t a) {
   return a < 2 ? v : (v + a - 1) & ~(a - 1);
 }
@@ -192,6 +211,16 @@ static const char *strat(Obj *o, const char *tab, uint64_t tabsz, uint64_t i,
 
 static const char *secname(Obj *o, int i) {
   return strat(o, o->shstr, o->shstrsz, o->sh[i].sh_name, "section");
+}
+
+static const char *symname(Obj *o, uint32_t i) {
+  if ((int)i >= o->nsym) die("%s: symbol index %u out of range", o->path, i);
+  if (ST_TYPE(o->sym[i].st_info) == 3 /* STT_SECTION */ &&
+      o->sym[i].st_name == 0) {
+    uint16_t sx = o->sym[i].st_shndx;
+    if (sx < (uint16_t)o->nsh) return secname(o, sx);
+  }
+  return strat(o, o->str, o->strsz, o->sym[i].st_name, "symbol");
 }
 
 static void read_obj(Obj *o, const char *path) {
@@ -331,6 +360,49 @@ static void gather(Obj *objs, int nobj) {
     }
 }
 
+// ------------------------------------------------------- symbols and addresses
+
+// Register every global definition, diagnosing duplicates. Weak loses to
+// strong; two strong definitions of the same name is an error, because
+// silently picking one is how a linker produces a program that runs the wrong
+// code.
+static void resolve_defs(Obj *objs, int nobj) {
+  for (int oi = 0; oi < nobj; oi++) {
+    Obj *o = &objs[oi];
+    for (int i = 0; i < o->nsym; i++) {
+      Sym *s = &o->sym[i];
+      int bind = ST_BIND(s->st_info);
+      if (bind == STB_LOCAL) continue;
+      if (s->st_shndx == SHN_UNDEF) continue;
+      if (s->st_shndx == SHN_COMMON)
+        die("%s: '%s' is a COMMON symbol; lnk does not allocate commons. "
+            "Compile with -fno-common (gcc's default since 10) so tentative "
+            "definitions land in .bss.",
+            o->path, symname(o, (uint32_t)i));
+      const char *nm = symname(o, (uint32_t)i);
+      int weak = bind == STB_WEAK;
+      Gsym *g = gfind(nm);
+      if (g) {
+        if (!weak && !g->weak)
+          die("duplicate definition of '%s': in %s and %s", nm, g->o->path, o->path);
+        if (!weak) { g->o = o; g->idx = (uint32_t)i; g->weak = 0; }
+        continue;
+      }
+      if (ngsym == cgsym) {
+        cgsym = cgsym ? cgsym * 2 : 64;
+        Gsym *n = xmalloc((size_t)cgsym * sizeof(Gsym));
+        memcpy(n, gsym, (size_t)ngsym * sizeof(Gsym));
+        gsym = n;
+      }
+      gsym[ngsym].name = nm;
+      gsym[ngsym].o = o;
+      gsym[ngsym].idx = (uint32_t)i;
+      gsym[ngsym].weak = weak;
+      ngsym++;
+    }
+  }
+}
+
 // -------------------------------------------------------------------- main
 
 int main(int argc, char **argv) {
@@ -360,11 +432,11 @@ int main(int argc, char **argv) {
 
   gather(objs, nin);
   if (!nout) die("no allocatable sections in the input: nothing to link");
+  resolve_defs(objs, nin);
 
-  // No output yet, so print the merged section table. It is the only way to see
-  // whether the merge and the alignment are right before addresses exist.
   for (int i = 0; i < nout; i++)
     printf("%-18s size %8llu  align %4llu\n", out[i].name,
            (unsigned long long)out[i].size, (unsigned long long)out[i].align);
+  printf("%d global symbol%s defined\n", ngsym, ngsym == 1 ? "" : "s");
   return 0;
 }
