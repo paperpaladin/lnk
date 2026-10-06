@@ -124,6 +124,16 @@ static void *xmalloc(size_t n) {
 #define PAGE 0x1000ull
 #define BASE 0x400000ull  // classic x86-64 non-PIE load address
 
+// An output section: all input sections sharing a name, concatenated.
+typedef struct {
+  const char *name;
+  uint32_t type;        // SHT_PROGBITS or SHT_NOBITS
+  uint64_t flags;       // SHF_* from the inputs (they must agree)
+  uint64_t align, size; // accumulated
+  uint64_t addr, off;   // assigned by layout()
+  int cls;              // 0 code, 1 rodata, 2 data, 3 bss -- segment ordering
+} Osec;
+
 typedef struct Obj Obj;
 struct Obj {
   const char *path;
@@ -141,6 +151,13 @@ struct Obj {
   uint64_t *ooff;       // per input section: offset within that output section
   int gnu_stack;        // saw a .note.GNU-stack section
 };
+
+static Osec out[64];
+static int nout;
+
+static uint64_t align_up(uint64_t v, uint64_t a) {
+  return a < 2 ? v : (v + a - 1) & ~(a - 1);
+}
 
 // --------------------------------------------------------------- input parsing
 // Everything below treats the object file as hostile: every offset is checked
@@ -251,6 +268,69 @@ static void read_obj(Obj *o, const char *path) {
   }
 }
 
+// ----------------------------------------------------------- section gathering
+
+static int seccls(uint64_t flags, uint32_t type) {
+  if (!(flags & SHF_WRITE)) return (flags & SHF_EXECINSTR) ? 0 : 1;
+  return type == SHT_NOBITS ? 3 : 2;
+}
+
+static void gather(Obj *objs, int nobj) {
+  for (int oi = 0; oi < nobj; oi++) {
+    Obj *o = &objs[oi];
+    for (int i = 1; i < o->nsh; i++) {
+      Shdr *s = &o->sh[i];
+      if (!(s->sh_flags & SHF_ALLOC)) continue;  // .comment, debug info, notes
+      // gcc emits an empty .data and .bss in almost every object. Dropping them
+      // here keeps the output from growing a zero-length section and, when every
+      // input is like that, a zero-length PT_LOAD.
+      if (s->sh_size == 0) continue;
+      if (s->sh_type != SHT_PROGBITS && s->sh_type != SHT_NOBITS)
+        die("%s: allocated section '%s' has type %u, which lnk cannot place",
+            o->path, secname(o, i), s->sh_type);
+      const char *nm = secname(o, i);
+      Osec *os = NULL;
+      for (int k = 0; k < nout; k++)
+        if (!strcmp(out[k].name, nm)) { os = &out[k]; break; }
+      if (!os) {
+        if (nout == (int)(sizeof out / sizeof *out))
+          die("too many distinct output sections (limit %d)", nout);
+        os = &out[nout++];
+        os->name = nm;
+        os->type = s->sh_type;
+        os->flags = s->sh_flags;
+        os->align = 1;
+        os->cls = seccls(s->sh_flags, s->sh_type);
+      }
+      // A NOBITS input merged into a PROGBITS output would need file bytes we
+      // are not going to write, and vice versa. gcc never does it; say so
+      // rather than produce a silently short section.
+      if (os->type != s->sh_type)
+        die("%s: section '%s' is type %u here but %u in an earlier object",
+            o->path, nm, s->sh_type, os->type);
+      if (s->sh_addralign > os->align) os->align = s->sh_addralign;
+      o->osec[i] = (int)(os - out);
+      o->ooff[i] = align_up(os->size, s->sh_addralign ? s->sh_addralign : 1);
+      os->size = o->ooff[i] + s->sh_size;
+    }
+  }
+
+  // Stable sort by class so the read-only sections form one contiguous run and
+  // the writable ones another: that is what lets two PT_LOAD segments cover
+  // everything, with .bss last so it can be the part with no file bytes.
+  for (int i = 1; i < nout; i++)
+    for (int j = i; j > 0 && out[j - 1].cls > out[j].cls; j--) {
+      Osec t = out[j - 1];
+      out[j - 1] = out[j];
+      out[j] = t;
+      for (int oi = 0; oi < nobj; oi++)
+        for (int k = 1; k < objs[oi].nsh; k++) {
+          if (objs[oi].osec[k] == j - 1) objs[oi].osec[k] = j;
+          else if (objs[oi].osec[k] == j) objs[oi].osec[k] = j - 1;
+        }
+    }
+}
+
 // -------------------------------------------------------------------- main
 
 int main(int argc, char **argv) {
@@ -278,8 +358,13 @@ int main(int argc, char **argv) {
   Obj *objs = xmalloc((size_t)nin * sizeof(Obj));
   for (int i = 0; i < nin; i++) read_obj(&objs[i], in[i]);
 
-  // Reading and validating is all there is so far. Every later pass is built on
-  // top of this, and a reader that trusts a malformed object is a linker that
-  // crashes on one, so the bounds checks come before any of the linking.
+  gather(objs, nin);
+  if (!nout) die("no allocatable sections in the input: nothing to link");
+
+  // No output yet, so print the merged section table. It is the only way to see
+  // whether the merge and the alignment are right before addresses exist.
+  for (int i = 0; i < nout; i++)
+    printf("%-18s size %8llu  align %4llu\n", out[i].name,
+           (unsigned long long)out[i].size, (unsigned long long)out[i].align);
   return 0;
 }
