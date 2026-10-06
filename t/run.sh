@@ -1,5 +1,5 @@
 #!/bin/sh
-# Three oracles, in order of how little they can be argued with:
+# The oracle, in order of how little it can be argued with:
 #
 #   1. the kernel executes the output, or it does not  -> runs()
 #   2. the system ld links the same objects to a program that behaves
@@ -7,6 +7,7 @@
 #   3. readelf accepts the headers, and the two things that make a hand-written
 #      linker emit an instant-segfault binary are asserted directly: segment
 #      vaddr == offset (mod page), and p_filesz <= p_memsz   -> validates()
+#   4. bad input is refused, by name, rather than linked to zero -> rejects()
 #
 # Nothing here has a hand-computed address in it. Every expectation is either an
 # exit status the program itself chose, or whatever ld did.
@@ -97,6 +98,18 @@ for f in load:
   ok
 }
 
+# --- oracle 4: refused by name, never silently linked to zero
+rejects() {
+  what="$1" pat="$2"; shift 2
+  if ./lnk -o t/tmp.bin "$@" > t/tmp.err 2>&1; then
+    no "$what: lnk exited 0, but should have refused"; return
+  fi
+  if ! grep -q "$pat" t/tmp.err; then
+    no "$what: error message does not mention '$pat'" "$(cat t/tmp.err)"; return
+  fi
+  ok
+}
+
 # ---------------------------------------------------------------------- objects
 build t/exit42.o t/exit42.c || exit 1
 
@@ -114,6 +127,13 @@ build t/weak2.o  t/weak2.c  || exit 1
 
 gcc -c -o t/asm.o t/asm.s || no "gcc -c t/asm.s"
 
+build t/undef.o  t/undef.c  || exit 1
+build t/dup.o    t/dup.c    || exit 1
+
+# -fPIC on purpose, and without $CF because its -fno-pie would cancel it: this
+# object carries a GOT-based relocation that lnk must refuse by name.
+gcc -c -fPIC -O1 -o t/gotpc.o t/gotpc.c || no "gcc -c -fPIC t/gotpc.c"
+
 # A text section bigger than one page, and more than a page of initialised data,
 # generated rather than checked in: the interesting part is the page crossing,
 # not the source.
@@ -130,6 +150,11 @@ gcc -c -o t/asm.o t/asm.s || no "gcc -c t/asm.s"
   echo '  for(int i=0;i<8192;i++) s+=widebss[i]; s+=chain(0); sys_exit(s%251); }'
 } > t/tmp.pages.c
 build t/pages.o t/tmp.pages.c || exit 1
+
+# An object with no .note.GNU-stack, to exercise the exec-stack path.
+printf '\t.text\n\t.globl nostack_fn\nnostack_fn:\n\tret\n' > t/tmp.nostack.s
+gcc -c -Wa,--noexecstack -o /dev/null t/tmp.nostack.s 2>/dev/null
+as -o t/tmp.nostack.o t/tmp.nostack.s || no "as t/tmp.nostack.s"
 
 # --------------------------------------------------------- 1. the kernel runs it
 runs "single object, raw syscall _start" 42 "" t/exit42.o
@@ -151,6 +176,7 @@ if ./lnk -o t/tmp.bin -e page_entry t/pages.o 2> t/tmp.err; then
 else
   no "-e page_entry: lnk refused" "$(cat t/tmp.err)"
 fi
+rejects "default entry _start is required" "_start" t/pages.o
 
 # ------------------------------------------------------ 2. ld is the reference
 agrees "three objects"        t/main.o t/lib.o t/asm.o
@@ -178,6 +204,26 @@ for f in (l.split() for l in sys.stdin):
         print("yes" if fs < ms else "no: filesz %#x memsz %#x" % (fs, ms))
 ')
 if [ "$bss" = yes ]; then ok; else no ".bss: RW segment p_filesz < p_memsz" "got: $bss"; fi
+
+# --------------------------------------------------------- 4. refused, by name
+rejects "undefined function reported by name" "nowhere_at_all" t/undef.o
+printf 'extern int missing_global;\nint *p = &missing_global;\nvoid _start(void){}\n' > t/tmp.undefdata.c
+build t/tmp.undefdata.o t/tmp.undefdata.c
+rejects "undefined global reported by name"   "missing_global" t/tmp.undefdata.o
+rejects "duplicate definition"                "duplicate definition of 'collide'" t/exit42.o t/dup.o t/dup.o
+rejects "unsupported GOT relocation named"    "R_X86_64_REX_GOTPCRELX" t/gotpc.o
+rejects "unknown entry symbol"                "nosuch" -e nosuch t/exit42.o
+rejects "an executable is not a relocatable object" "not a relocatable object" /bin/true
+head -c 300 /dev/urandom > t/tmp.junk.o
+rejects "random bytes"                        "not an ELF file" t/tmp.junk.o
+head -c 120 t/lib.o > t/tmp.trunc.o
+rejects "truncated object"                    "lnk:" t/tmp.trunc.o
+
+# The .note.GNU-stack convention: a missing note means the object is asking for
+# an executable stack, and that has to be said out loud.
+if ./lnk -o t/tmp.bin -e nostack_fn t/tmp.nostack.o 2> t/tmp.err &&
+   grep -q "executable stack" t/tmp.err; then ok
+else no "missing .note.GNU-stack is warned about" "$(cat t/tmp.err)"; fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
