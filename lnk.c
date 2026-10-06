@@ -400,51 +400,72 @@ static void gather(Obj *objs, int nobj) {
 
 // ----------------------------------------------------------------- the layout
 
-static uint64_t rx_end, rw_off, rw_file_end, rw_vend, img_end;
+static uint64_t rx_filesz;                       // the RX segment, from offset 0
+static uint64_t rw_off, rw_vaddr, rw_filesz, rw_memsz;
+static uint64_t img_end;                         // first byte past the last segment
 static int have_rw;
 static uint64_t hdrsz;
 static int nph;
 
+// Place every output section, and with it the two load segments.
+//
+// The one invariant that matters: within a loadable segment, p_vaddr - p_offset
+// is a constant multiple of the page size. The kernel maps a segment by mmap'ing
+// from p_offset rounded *down* to a page boundary at p_vaddr rounded down
+// likewise. If the low 12 bits of the two disagree, every byte in the segment
+// lands at an address 12 bits off from where the relocations put it, and the
+// first instruction fetched is garbage. So rather than align the file offset and
+// the virtual address separately and hope they stay in step, this keeps the
+// difference (`delta`) fixed per segment and derives the offset from the address.
 static void layout(void) {
   nph = 2;  // one LOAD, plus PT_GNU_STACK
   for (int i = 0; i < nout; i++)
     if (out[i].flags & SHF_WRITE) { nph = 3; have_rw = 1; break; }
   hdrsz = sizeof(Ehdr) + (uint64_t)nph * sizeof(Phdr);
 
-  // The first segment starts at file offset 0 so the headers themselves are
-  // mapped, which is what ld does and what makes vaddr == BASE + offset hold for
-  // everything in it.
-  uint64_t off = hdrsz, vaddr = BASE + hdrsz;
-  rx_end = hdrsz;
+  // The first segment starts at file offset 0 so the ELF and program headers are
+  // themselves mapped, which is what ld does and what makes delta == BASE.
+  uint64_t delta = BASE, off = hdrsz, vaddr = BASE + hdrsz;
+  int in_rw = 0;
+  rx_filesz = hdrsz;
 
   for (int i = 0; i < nout; i++) {
     Osec *os = &out[i];
-    if ((os->flags & SHF_WRITE) && !rw_off) {
-      // A new segment. Writable data cannot share a page with the read-execute
-      // text, because mmap's granularity is a page and a page gets one set of
-      // permissions. So round the file offset up to a page.
-      rx_end = off;
+    uint64_t a = os->align ? os->align : 1;
+    if ((os->flags & SHF_WRITE) && !in_rw) {
+      rx_filesz = off;
+      // Writable data cannot share a page with read-execute text: mmap's
+      // granularity is a page and a page gets one set of permissions. So the
+      // second segment starts on a fresh page, and delta is recomputed there --
+      // which is also why an over-aligned .data costs nothing here, while an
+      // over-aligned section in the middle of a segment has to be paid for in
+      // file padding (shortcut: nobody has such an object; a third segment
+      // would fix it).
+      if (a < PAGE) a = PAGE;
+      vaddr = align_up(vaddr, a);
       off = align_up(off, PAGE);
-      vaddr = BASE + off;
+      delta = vaddr - off;  // a multiple of PAGE, since both operands are
       rw_off = off;
+      rw_vaddr = vaddr;
+      in_rw = 1;
+    } else {
+      vaddr = align_up(vaddr, a);
+      // NOBITS consumes address space but no file bytes, so the file offset
+      // stays where the last initialised byte left it.
+      if (os->type != SHT_NOBITS) off = vaddr - delta;
     }
-    // Every loadable segment must satisfy p_vaddr == p_offset (mod PAGE). The
-    // kernel maps whole pages: it mmaps from p_offset rounded down to a page
-    // boundary at p_vaddr rounded down likewise, so if the low 12 bits of the
-    // two disagree, every byte in the segment lands at the wrong address and the
-    // first instruction fetched is garbage. Keeping vaddr == BASE + off, with
-    // BASE page-aligned, makes the congruence hold by construction instead of by
-    // arithmetic we could get wrong.
-    off = align_up(off, os->align);
-    vaddr = align_up(vaddr, os->align);
-    os->off = off;
     os->addr = vaddr;
+    os->off = off;
     vaddr += os->size;
-    if (os->type != SHT_NOBITS) off += os->size;
+    if (os->type != SHT_NOBITS) off = vaddr - delta;
   }
-  if (!rw_off) rx_end = off;
-  rw_file_end = off;
-  rw_vend = vaddr;
+
+  if (in_rw) {
+    rw_filesz = off - rw_off;
+    rw_memsz = vaddr - rw_vaddr;
+  } else {
+    rx_filesz = off;
+  }
   img_end = off;
 }
 
@@ -664,6 +685,27 @@ static void alloc_image(void) {
   img = xmalloc(imgsz);
 }
 
+// The hard invariant, made executable: every binary lnk emits either runs
+// correctly or was never written. Both of these mistakes produce a file that
+// links cleanly and then dies on the first instruction, so they are checked
+// here rather than trusted to the layout code above.
+static void check_segment(const char *what, uint64_t off, uint64_t vaddr,
+                          uint64_t filesz, uint64_t memsz) {
+  if ((vaddr - off) % PAGE)
+    die("internal error: the %s segment's vaddr 0x%llx and file offset 0x%llx "
+        "are not congruent modulo the 0x%llx page size. The kernel would map it "
+        "at the wrong address; refusing to write the file.",
+        what, (unsigned long long)vaddr, (unsigned long long)off,
+        (unsigned long long)PAGE);
+  if (filesz > memsz)
+    die("internal error: the %s segment has p_filesz 0x%llx > p_memsz 0x%llx",
+        what, (unsigned long long)filesz, (unsigned long long)memsz);
+  if (off + filesz > imgsz)
+    die("internal error: the %s segment ends at 0x%llx, past the 0x%llx byte "
+        "image",
+        what, (unsigned long long)(off + filesz), (unsigned long long)imgsz);
+}
+
 static void write_out(const char *path, uint64_t entry, int exec_stack) {
   put32(0, 0x464c457fu);        // \x7fELF
   img[4] = 2;                   // ELFCLASS64
@@ -684,6 +726,9 @@ static void write_out(const char *path, uint64_t entry, int exec_stack) {
   put16(60, (uint16_t)nsh);
   put16(62, (uint16_t)(nsh - 1));  // e_shstrndx
 
+  check_segment("read-execute", 0, BASE, rx_filesz, rx_filesz);
+  if (have_rw) check_segment("read-write", rw_off, rw_vaddr, rw_filesz, rw_memsz);
+
   uint64_t p = sizeof(Ehdr);
   // RX: the headers plus everything not writable.
   put32(p, PT_LOAD);
@@ -691,8 +736,8 @@ static void write_out(const char *path, uint64_t entry, int exec_stack) {
   put64(p + 8, 0);
   put64(p + 16, BASE);
   put64(p + 24, BASE);
-  put64(p + 32, rx_end);
-  put64(p + 40, rx_end);
+  put64(p + 32, rx_filesz);
+  put64(p + 40, rx_filesz);
   put64(p + 48, PAGE);
   p += sizeof(Phdr);
 
@@ -700,16 +745,16 @@ static void write_out(const char *path, uint64_t entry, int exec_stack) {
     put32(p, PT_LOAD);
     put32(p + 4, PF_R | PF_W);
     put64(p + 8, rw_off);
-    put64(p + 16, BASE + rw_off);
-    put64(p + 24, BASE + rw_off);
+    put64(p + 16, rw_vaddr);
+    put64(p + 24, rw_vaddr);
     // .bss is the whole reason these two numbers differ. It is allocated at run
     // time but occupies no bytes in the file, so p_filesz counts only the
     // initialised data and p_memsz extends past it; the kernel zero-fills the
     // difference. Make them equal and every global that should start at zero
     // instead reads whatever bytes follow .data in the file -- or faults,
     // because the page holding it was never mapped at all.
-    put64(p + 32, rw_file_end - rw_off);
-    put64(p + 40, rw_vend - (BASE + rw_off));
+    put64(p + 32, rw_filesz);
+    put64(p + 40, rw_memsz);
     put64(p + 48, PAGE);
     p += sizeof(Phdr);
   }

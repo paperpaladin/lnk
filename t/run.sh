@@ -185,6 +185,16 @@ agrees "weak and local names" t/weak.o t/weak2.o
 agrees "multi-page text and data" -e page_entry t/pages.o
 agrees "single object"        t/exit42.o
 
+
+# The regression for commit 02: an alignment larger than the 0x400000 load base
+# used to break the vaddr/offset congruence and produce a segment header that
+# did not cover its own section. ld gets this right, so ld is the assertion.
+printf 'int tbl[4] __attribute__((aligned(0x800000))) = {1,2,3,4};\nstatic void sys_exit(long c){__asm__ volatile("syscall"::"a"(60L),"D"(c):"memory");__builtin_unreachable();}\nvoid _start(void){ sys_exit(tbl[0]+tbl[3]); }\n' > t/tmp.align.c
+build t/tmp.align.o t/tmp.align.c
+agrees "section aligned past the load base" t/tmp.align.o
+./lnk -o t/tmp.v4 t/tmp.align.o 2>/dev/null
+validates "section aligned past the load base" t/tmp.v4
+
 # ---------------------------------------------------------- 3. readelf and the
 #                                                               layout invariants
 ./lnk -o t/tmp.v1 t/main.o t/lib.o t/asm.o 2>/dev/null
