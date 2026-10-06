@@ -111,6 +111,15 @@ static void die(const char *fmt, ...) {
   exit(1);
 }
 
+static void warn(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  fputs("lnk: warning: ", stderr);
+  vfprintf(stderr, fmt, ap);
+  fputc('\n', stderr);
+  va_end(ap);
+}
+
 // shortcut: nothing in lnk is ever freed. A linker is a short-lived process and
 // exit() reclaims everything; a free() pass would be pure risk for no gain.
 static void *xmalloc(size_t n) {
@@ -469,10 +478,145 @@ static void resolve_defs(Obj *objs, int nobj) {
   }
 }
 
-// -------------------------------------------------------------------- main
+// ------------------------------------------------------------- the output image
+// shortcut: the entire output is built in one in-memory buffer and written with
+// a single fwrite, rather than seeking around a stream. The buffer is the size
+// of the program being linked, so the ceiling is linking something larger than
+// RAM; the upgrade is pwrite per section.
+
+static unsigned char *img;
+static uint64_t imgsz;
+
+static void put16(uint64_t off, uint16_t v) { memcpy(img + off, &v, 2); }
+static void put32(uint64_t off, uint32_t v) { memcpy(img + off, &v, 4); }
+static void put64(uint64_t off, uint64_t v) { memcpy(img + off, &v, 8); }
+
+static void copy_sections(Obj *objs, int nobj) {
+  for (int oi = 0; oi < nobj; oi++) {
+    Obj *o = &objs[oi];
+    for (int i = 1; i < o->nsh; i++) {
+      if (o->osec[i] < 0) continue;
+      Shdr *s = &o->sh[i];
+      if (s->sh_type == SHT_NOBITS) continue;  // .bss: nothing to copy
+      memcpy(img + out[o->osec[i]].off + o->ooff[i], at(o, s->sh_offset, s->sh_size),
+             s->sh_size);
+    }
+  }
+}
+
+// ------------------------------------------------------------------- the write
+
+// Sizes of everything past the last segment, so the image can be allocated
+// before section contents are copied into it.
+static uint64_t shstr_off, shstrsz, shoff;
+static int nsh;
+
+// shortcut: no .symtab or .strtab in the output, so nm and gdb see nothing in a
+// linked binary (objdump -d still works, since the section headers are real).
+// Copying the input symbol tables out with their values fixed up is maybe 40
+// lines; nothing needs it yet.
+static void alloc_image(void) {
+  shstr_off = img_end;
+  shstrsz = 1;
+  for (int i = 0; i < nout; i++) shstrsz += strlen(out[i].name) + 1;
+  shstrsz += strlen(".shstrtab") + 1;
+  shoff = align_up(shstr_off + shstrsz, 8);
+  nsh = nout + 2;  // SHN_UNDEF, ours, .shstrtab
+  imgsz = shoff + (uint64_t)nsh * sizeof(Shdr);
+  img = xmalloc(imgsz);
+}
+
+static void write_out(const char *path, uint64_t entry, int exec_stack) {
+  put32(0, 0x464c457fu);        // \x7fELF
+  img[4] = 2;                   // ELFCLASS64
+  img[5] = 1;                   // ELFDATA2LSB
+  img[6] = 1;                   // EV_CURRENT
+  img[7] = 0;                   // ELFOSABI_NONE
+  put16(16, ET_EXEC);
+  put16(18, EM_X86_64);
+  put32(20, 1);
+  put64(24, entry);
+  put64(32, sizeof(Ehdr));      // e_phoff
+  put64(40, shoff);
+  put32(48, 0);                 // e_flags
+  put16(52, sizeof(Ehdr));
+  put16(54, sizeof(Phdr));
+  put16(56, (uint16_t)nph);
+  put16(58, sizeof(Shdr));
+  put16(60, (uint16_t)nsh);
+  put16(62, (uint16_t)(nsh - 1));  // e_shstrndx
+
+  uint64_t p = sizeof(Ehdr);
+  // RX: the headers plus everything not writable.
+  put32(p, PT_LOAD);
+  put32(p + 4, PF_R | PF_X);
+  put64(p + 8, 0);
+  put64(p + 16, BASE);
+  put64(p + 24, BASE);
+  put64(p + 32, rx_end);
+  put64(p + 40, rx_end);
+  put64(p + 48, PAGE);
+  p += sizeof(Phdr);
+
+  if (have_rw) {
+    put32(p, PT_LOAD);
+    put32(p + 4, PF_R | PF_W);
+    put64(p + 8, rw_off);
+    put64(p + 16, BASE + rw_off);
+    put64(p + 24, BASE + rw_off);
+    // .bss is the whole reason these two numbers differ. It is allocated at run
+    // time but occupies no bytes in the file, so p_filesz counts only the
+    // initialised data and p_memsz extends past it; the kernel zero-fills the
+    // difference. Make them equal and every global that should start at zero
+    // instead reads whatever bytes follow .data in the file -- or faults,
+    // because the page holding it was never mapped at all.
+    put64(p + 32, rw_file_end - rw_off);
+    put64(p + 40, rw_vend - (BASE + rw_off));
+    put64(p + 48, PAGE);
+    p += sizeof(Phdr);
+  }
+
+  // The .note.GNU-stack convention: an object carrying that (empty, unallocated)
+  // section is declaring that it does not need an executable stack. The
+  // linker's job is to turn the unanimous agreement of all the inputs into a
+  // PT_GNU_STACK without PF_X, which is the thing the kernel actually reads.
+  put32(p, PT_GNU_STACK);
+  put32(p + 4, exec_stack ? (uint32_t)(PF_R | PF_W | PF_X) : (uint32_t)(PF_R | PF_W));
+  put64(p + 48, 0x10);
+
+  // Section headers. Entry 0 is the all-zero SHN_UNDEF entry, already zero.
+  uint64_t so = shoff + sizeof(Shdr);
+  uint64_t nameoff = 1;
+  for (int i = 0; i < nout; i++, so += sizeof(Shdr)) {
+    size_t l = strlen(out[i].name) + 1;
+    memcpy(img + shstr_off + nameoff, out[i].name, l);
+    put32(so, (uint32_t)nameoff);
+    nameoff += l;
+    put32(so + 4, out[i].type);
+    put64(so + 8, out[i].flags);
+    put64(so + 16, out[i].addr);
+    put64(so + 24, out[i].off);
+    put64(so + 32, out[i].size);
+    put64(so + 48, out[i].align);
+  }
+  memcpy(img + shstr_off + nameoff, ".shstrtab", 10);
+  put32(so, (uint32_t)nameoff);
+  put32(so + 4, SHT_STRTAB);
+  put64(so + 24, shstr_off);
+  put64(so + 32, shstrsz);
+  put64(so + 48, 1);
+
+  FILE *f = fopen(path, "wb");
+  if (!f) die("cannot create %s", path);
+  if (fwrite(img, 1, imgsz, f) != imgsz) die("short write on %s", path);
+  if (fclose(f)) die("cannot close %s", path);
+  // The kernel will not exec a file without the x bit, and nothing else here is
+  // going to set it.
+  if (chmod(path, 0755)) die("cannot make %s executable", path);
+}
 
 int main(int argc, char **argv) {
-  const char *outpath = "a.out";
+  const char *outpath = "a.out", *entry = "_start";
   const char *in[256];
   int nin = 0;
 
@@ -491,7 +635,6 @@ int main(int argc, char **argv) {
     }
   }
   if (!nin) die("no input files");
-  (void)outpath;
 
   Obj *objs = xmalloc((size_t)nin * sizeof(Obj));
   for (int i = 0; i < nin; i++) read_obj(&objs[i], in[i]);
@@ -501,15 +644,32 @@ int main(int argc, char **argv) {
   layout();
   resolve_defs(objs, nin);
 
-  Gsym *e = gfind("_start");
-  if (!e) die("entry symbol '_start' is not defined in any input");
+  Gsym *e = gfind(entry);
+  if (!e)
+    die("entry symbol '%s' is not defined in any input%s", entry, "");
+  uint64_t entry_addr = gval(e);
 
-  // Still no file written, so print the map. Addresses that look wrong here are
-  // much cheaper to find than addresses that look wrong in a core dump.
-  for (int i = 0; i < nout; i++)
-    printf("%-18s addr 0x%08llx  off 0x%06llx  size %8llu\n", out[i].name,
-           (unsigned long long)out[i].addr, (unsigned long long)out[i].off,
-           (unsigned long long)out[i].size);
-  printf("entry _start = 0x%llx\n", (unsigned long long)gval(e));
+  int exec_stack = 0;
+  for (int i = 0; i < nin; i++)
+    if (!objs[i].gnu_stack) exec_stack = 1;
+  if (exec_stack)
+    warn("at least one input has no .note.GNU-stack section, so the output "
+         "requests an executable stack");
+
+  alloc_image();
+  copy_sections(objs, nin);
+
+  // Relocations are not applied yet, and an unrelocated call is a call to the
+  // wrong address. Refuse rather than write a file that cannot work.
+  for (int oi = 0; oi < nin; oi++)
+    for (int i = 1; i < objs[oi].nsh; i++)
+      if (objs[oi].sh[i].sh_type == SHT_RELA &&
+          objs[oi].sh[i].sh_info < (uint32_t)objs[oi].nsh &&
+          objs[oi].osec[objs[oi].sh[i].sh_info] >= 0)
+        die("%s: '%s' has relocations and lnk does not apply them yet; it would "
+            "write a binary whose every cross-section reference is wrong",
+            objs[oi].path, secname(&objs[oi], (int)objs[oi].sh[i].sh_info));
+
+  write_out(outpath, entry_addr, exec_stack);
   return 0;
 }
