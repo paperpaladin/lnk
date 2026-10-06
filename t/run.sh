@@ -1,11 +1,13 @@
 #!/bin/sh
-# The oracle is the kernel: each case links a program out of object files and
-# then runs it, asserting its exit status and its stdout. The test programs are
-# freestanding -- a `_start` that makes raw `write` and `exit_group` syscalls --
-# so a failure cannot be blamed on glibc's startup path.
+# Two oracles, in order of how little they can be argued with:
 #
-# Nothing here has a hand-computed address in it. Every expectation is an exit
-# status or a string the program itself chose.
+#   1. the kernel executes the output, or it does not  -> runs()
+#   2. the system ld links the same objects to a program that behaves
+#      identically                                     -> agrees()
+#
+# The test programs are freestanding -- a `_start` making raw syscalls -- so a
+# failure cannot be blamed on glibc's startup path, and nothing here has a
+# hand-computed address in it.
 cd "$(dirname "$0")/.." || exit 1
 
 pass=0
@@ -36,6 +38,28 @@ runs() {
   fi
   if [ "$gotout" != "$wantout" ]; then
     no "$what: stdout" "expected [$wantout]" "got      [$gotout]"; return
+  fi
+  ok
+}
+
+# --- oracle 2: the system linker is the reference implementation
+agrees() {
+  what="$1"; shift
+  entry=""
+  case "$1" in -e) entry="-e $2"; shift 2;; esac
+  if ! ./lnk -o t/tmp.a $entry "$@" 2> t/tmp.err; then
+    no "$what vs ld: lnk refused to link" "$(cat t/tmp.err)"; return
+  fi
+  if ! ld -o t/tmp.b $entry "$@" 2> t/tmp.err; then
+    no "$what vs ld: ld refused to link" "$(cat t/tmp.err)"; return
+  fi
+  ./t/tmp.a > t/tmp.oa 2>/dev/null; ra=$?
+  ./t/tmp.b > t/tmp.ob 2>/dev/null; rb=$?
+  if [ "$ra" != "$rb" ]; then
+    no "$what vs ld: exit status" "lnk gave $ra, ld gave $rb"; return
+  fi
+  if ! cmp -s t/tmp.oa t/tmp.ob; then
+    no "$what vs ld: stdout differs" "$(cmp t/tmp.oa t/tmp.ob 2>&1)"; return
   fi
   ok
 }
@@ -94,6 +118,13 @@ if ./lnk -o t/tmp.bin -e page_entry t/pages.o 2> t/tmp.err; then
 else
   no "-e page_entry: lnk refused" "$(cat t/tmp.err)"
 fi
+
+# ------------------------------------------------------ 2. ld is the reference
+agrees "three objects"        t/main.o t/lib.o t/asm.o
+agrees "reverse link order"   t/asm.o t/lib.o t/main.o
+agrees "weak and local names" t/weak.o t/weak2.o
+agrees "multi-page text and data" -e page_entry t/pages.o
+agrees "single object"        t/exit42.o
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
