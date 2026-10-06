@@ -360,7 +360,73 @@ static void gather(Obj *objs, int nobj) {
     }
 }
 
+// ----------------------------------------------------------------- the layout
+
+static uint64_t rx_end, rw_off, rw_file_end, rw_vend, img_end;
+static int have_rw;
+static uint64_t hdrsz;
+static int nph;
+
+static void layout(void) {
+  nph = 2;  // one LOAD, plus PT_GNU_STACK
+  for (int i = 0; i < nout; i++)
+    if (out[i].flags & SHF_WRITE) { nph = 3; have_rw = 1; break; }
+  hdrsz = sizeof(Ehdr) + (uint64_t)nph * sizeof(Phdr);
+
+  // The first segment starts at file offset 0 so the headers themselves are
+  // mapped, which is what ld does and what makes vaddr == BASE + offset hold for
+  // everything in it.
+  uint64_t off = hdrsz, vaddr = BASE + hdrsz;
+  rx_end = hdrsz;
+
+  for (int i = 0; i < nout; i++) {
+    Osec *os = &out[i];
+    if ((os->flags & SHF_WRITE) && !rw_off) {
+      // A new segment. Writable data cannot share a page with the read-execute
+      // text, because mmap's granularity is a page and a page gets one set of
+      // permissions. So round the file offset up to a page.
+      rx_end = off;
+      off = align_up(off, PAGE);
+      vaddr = BASE + off;
+      rw_off = off;
+    }
+    // Every loadable segment must satisfy p_vaddr == p_offset (mod PAGE). The
+    // kernel maps whole pages: it mmaps from p_offset rounded down to a page
+    // boundary at p_vaddr rounded down likewise, so if the low 12 bits of the
+    // two disagree, every byte in the segment lands at the wrong address and the
+    // first instruction fetched is garbage. Keeping vaddr == BASE + off, with
+    // BASE page-aligned, makes the congruence hold by construction instead of by
+    // arithmetic we could get wrong.
+    off = align_up(off, os->align);
+    vaddr = align_up(vaddr, os->align);
+    os->off = off;
+    os->addr = vaddr;
+    vaddr += os->size;
+    if (os->type != SHT_NOBITS) off += os->size;
+  }
+  if (!rw_off) rx_end = off;
+  rw_file_end = off;
+  rw_vend = vaddr;
+  img_end = off;
+}
+
 // ------------------------------------------------------- symbols and addresses
+
+static uint64_t secaddr(Obj *o, uint16_t shndx, const char *what) {
+  if (shndx >= (uint16_t)o->nsh)
+    die("%s: %s lives in section %u, which does not exist", o->path, what, shndx);
+  if (o->osec[shndx] < 0)
+    die("%s: %s lives in section '%s', which lnk did not place in the output "
+        "(it is either not SHF_ALLOC or empty)",
+        o->path, what, secname(o, shndx));
+  return out[o->osec[shndx]].addr + o->ooff[shndx];
+}
+
+static uint64_t gval(Gsym *g) {
+  Sym *s = &g->o->sym[g->idx];
+  if (s->st_shndx == SHN_ABS) return s->st_value;
+  return secaddr(g->o, s->st_shndx, g->name) + s->st_value;
+}
 
 // Register every global definition, diagnosing duplicates. Weak loses to
 // strong; two strong definitions of the same name is an error, because
@@ -432,11 +498,18 @@ int main(int argc, char **argv) {
 
   gather(objs, nin);
   if (!nout) die("no allocatable sections in the input: nothing to link");
+  layout();
   resolve_defs(objs, nin);
 
+  Gsym *e = gfind("_start");
+  if (!e) die("entry symbol '_start' is not defined in any input");
+
+  // Still no file written, so print the map. Addresses that look wrong here are
+  // much cheaper to find than addresses that look wrong in a core dump.
   for (int i = 0; i < nout; i++)
-    printf("%-18s size %8llu  align %4llu\n", out[i].name,
-           (unsigned long long)out[i].size, (unsigned long long)out[i].align);
-  printf("%d global symbol%s defined\n", ngsym, ngsym == 1 ? "" : "s");
+    printf("%-18s addr 0x%08llx  off 0x%06llx  size %8llu\n", out[i].name,
+           (unsigned long long)out[i].addr, (unsigned long long)out[i].off,
+           (unsigned long long)out[i].size);
+  printf("entry _start = 0x%llx\n", (unsigned long long)gval(e));
   return 0;
 }
