@@ -99,6 +99,35 @@ enum {
   R_X86_64_CODE_4_GOTPCRELX = 43
 };
 
+static const char *reloc_name(uint32_t t) {
+  switch (t) {
+  case R_X86_64_NONE: return "R_X86_64_NONE";
+  case R_X86_64_64: return "R_X86_64_64";
+  case R_X86_64_PC32: return "R_X86_64_PC32";
+  case R_X86_64_GOT32: return "R_X86_64_GOT32";
+  case R_X86_64_PLT32: return "R_X86_64_PLT32";
+  case R_X86_64_GOTPCREL: return "R_X86_64_GOTPCREL";
+  case R_X86_64_32: return "R_X86_64_32";
+  case R_X86_64_32S: return "R_X86_64_32S";
+  case R_X86_64_16: return "R_X86_64_16";
+  case R_X86_64_PC16: return "R_X86_64_PC16";
+  case R_X86_64_8: return "R_X86_64_8";
+  case R_X86_64_PC8: return "R_X86_64_PC8";
+  case R_X86_64_TLSGD: return "R_X86_64_TLSGD";
+  case R_X86_64_TLSLD: return "R_X86_64_TLSLD";
+  case R_X86_64_DTPOFF32: return "R_X86_64_DTPOFF32";
+  case R_X86_64_GOTTPOFF: return "R_X86_64_GOTTPOFF";
+  case R_X86_64_TPOFF32: return "R_X86_64_TPOFF32";
+  case R_X86_64_PC64: return "R_X86_64_PC64";
+  case R_X86_64_GOTOFF64: return "R_X86_64_GOTOFF64";
+  case R_X86_64_GOTPC32: return "R_X86_64_GOTPC32";
+  case R_X86_64_GOTPCRELX: return "R_X86_64_GOTPCRELX";
+  case R_X86_64_REX_GOTPCRELX: return "R_X86_64_REX_GOTPCRELX";
+  case R_X86_64_CODE_4_GOTPCRELX: return "R_X86_64_CODE_4_GOTPCRELX";
+  default: return "unknown";
+  }
+}
+
 // ---------------------------------------------------------------- diagnostics
 
 static void die(const char *fmt, ...) {
@@ -478,6 +507,26 @@ static void resolve_defs(Obj *objs, int nobj) {
   }
 }
 
+// The value S of the symbol a relocation names.
+static uint64_t symval(Obj *o, uint32_t i, const char *ctx) {
+  if ((int)i >= o->nsym) die("%s: relocation names symbol %u, past end of .symtab", o->path, i);
+  Sym *s = &o->sym[i];
+  const char *nm = symname(o, i);
+  if (ST_BIND(s->st_info) != STB_LOCAL) {
+    Gsym *g = gfind(nm);
+    if (g) return gval(g);  // the winning definition, which may be elsewhere
+  }
+  if (s->st_shndx == SHN_UNDEF) {
+    // An undefined weak reference is defined by the ABI to be address zero.
+    if (ST_BIND(s->st_info) == STB_WEAK) return 0;
+    die("undefined symbol '%s', referenced by %s (%s)", nm, o->path, ctx);
+  }
+  if (s->st_shndx == SHN_ABS) return s->st_value;
+  if (s->st_shndx == SHN_COMMON)
+    die("%s: reference to COMMON symbol '%s'; recompile with -fno-common", o->path, nm);
+  return secaddr(o, s->st_shndx, nm) + s->st_value;
+}
+
 // ------------------------------------------------------------- the output image
 // shortcut: the entire output is built in one in-memory buffer and written with
 // a single fwrite, rather than seeking around a stream. The buffer is the size
@@ -500,6 +549,58 @@ static void copy_sections(Obj *objs, int nobj) {
       if (s->sh_type == SHT_NOBITS) continue;  // .bss: nothing to copy
       memcpy(img + out[o->osec[i]].off + o->ooff[i], at(o, s->sh_offset, s->sh_size),
              s->sh_size);
+    }
+  }
+}
+
+static void apply_rela(Obj *o, int ri) {
+  Shdr *rs = &o->sh[ri];
+  if (rs->sh_entsize != sizeof(Rela)) die("%s: RELA entsize is not 24", o->path);
+  if (rs->sh_size % sizeof(Rela)) die("%s: ragged RELA section", o->path);
+  uint32_t ti = rs->sh_info;
+  if (ti >= (uint32_t)o->nsh) die("%s: RELA sh_info out of range", o->path);
+  if (o->osec[ti] < 0) return;  // relocations for a section we did not keep
+  Osec *os = &out[o->osec[ti]];
+  if (os->type == SHT_NOBITS)
+    die("%s: relocations against '%s', which has no file contents", o->path,
+        secname(o, (int)ti));
+  uint64_t base_off = os->off + o->ooff[ti];
+  uint64_t base_addr = os->addr + o->ooff[ti];
+  uint64_t seclen = o->sh[ti].sh_size;
+  const char *where = secname(o, (int)ti);
+
+  uint64_t n = rs->sh_size / sizeof(Rela);
+  const unsigned char *raw = at(o, rs->sh_offset, rs->sh_size);
+  for (uint64_t k = 0; k < n; k++) {
+    Rela r;
+    memcpy(&r, raw + k * sizeof(Rela), sizeof r);
+    uint32_t type = R_TYPE(r.r_info);
+    if (type == R_X86_64_NONE) continue;
+    uint64_t width = 4;  // no 8-byte form is implemented yet
+    if (r.r_offset > seclen || width > seclen - r.r_offset)
+      die("%s: relocation at offset %llu runs past the end of '%s'", o->path,
+          (unsigned long long)r.r_offset, where);
+
+    uint64_t S = symval(o, R_SYM(r.r_info), where);
+    int64_t A = r.r_addend;
+    (void)S; (void)A;
+    // P is the address of the relocated field *in the output*, which is only
+    // knowable after layout -- hence the ordering of the passes above.
+    uint64_t P = base_addr + r.r_offset;
+    uint64_t at_off = base_off + r.r_offset;
+    const char *nm = symname(o, R_SYM(r.r_info));
+    // Nothing is applied yet, so the switch below only ever reaches its default.
+    (void)S; (void)A; (void)P; (void)at_off;
+
+    switch (type) {
+    default:
+      // Refusing beats emitting a plausible wrong address: a binary that links
+      // cleanly and then jumps into nowhere costs far more to debug.
+      die("%s: unsupported relocation type %u (%s) against '%s' in '%s'.\n"
+          "       lnk implements no relocation type at all yet. "
+          "GOT/PLT/TLS forms need a dynamic linker's machinery (see PLAN.md); "
+          "refusing rather than emitting a wrong address.",
+          o->path, type, reloc_name(type), nm, where);
     }
   }
 }
@@ -616,7 +717,8 @@ static void write_out(const char *path, uint64_t entry, int exec_stack) {
 }
 
 int main(int argc, char **argv) {
-  const char *outpath = "a.out", *entry = "_start";
+  const char *outpath = "a.out";
+  const char *entry = "_start";
   const char *in[256];
   int nin = 0;
 
@@ -625,7 +727,7 @@ int main(int argc, char **argv) {
       if (++i == argc) die("-o needs an argument");
       outpath = argv[i];
     } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fputs("usage: lnk -o OUT in1.o in2.o ...\n", stdout);
+      fputs("usage: lnk -o OUT [-e SYM] in1.o in2.o ...\n", stdout);
       return 0;
     } else if (argv[i][0] == '-' && argv[i][1]) {
       die("unknown option '%s' (lnk takes -o)", argv[i]);
@@ -646,7 +748,7 @@ int main(int argc, char **argv) {
 
   Gsym *e = gfind(entry);
   if (!e)
-    die("entry symbol '%s' is not defined in any input%s", entry, "");
+    die("entry symbol '%s' is not defined in any input", entry);
   uint64_t entry_addr = gval(e);
 
   int exec_stack = 0;
@@ -658,17 +760,9 @@ int main(int argc, char **argv) {
 
   alloc_image();
   copy_sections(objs, nin);
-
-  // Relocations are not applied yet, and an unrelocated call is a call to the
-  // wrong address. Refuse rather than write a file that cannot work.
   for (int oi = 0; oi < nin; oi++)
     for (int i = 1; i < objs[oi].nsh; i++)
-      if (objs[oi].sh[i].sh_type == SHT_RELA &&
-          objs[oi].sh[i].sh_info < (uint32_t)objs[oi].nsh &&
-          objs[oi].osec[objs[oi].sh[i].sh_info] >= 0)
-        die("%s: '%s' has relocations and lnk does not apply them yet; it would "
-            "write a binary whose every cross-section reference is wrong",
-            objs[oi].path, secname(&objs[oi], (int)objs[oi].sh[i].sh_info));
+      if (objs[oi].sh[i].sh_type == SHT_RELA) apply_rela(&objs[oi], i);
 
   write_out(outpath, entry_addr, exec_stack);
   return 0;
