@@ -57,6 +57,23 @@ build t/weak2.o  t/weak2.c  || exit 1
 
 gcc -c -o t/asm.o t/asm.s || no "gcc -c t/asm.s"
 
+# A text section bigger than one page, and more than a page of initialised data,
+# generated rather than checked in: the interesting part is the page crossing,
+# not the source.
+{
+  echo 'int chain(int x) {'
+  i=0; while [ $i -lt 400 ]; do echo "  x += $i; __asm__ volatile(\"nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop;nop\");"; i=$((i + 1)); done
+  echo '  return x; }'
+  echo 'int wide[2048] = {'
+  i=0; while [ $i -lt 2048 ]; do echo "$((i % 97)),"; i=$((i + 1)); done
+  echo '0};'
+  echo 'int widebss[8192];'
+  echo 'static void sys_exit(long c){__asm__ volatile("syscall"::"a"(60L),"D"(c):"memory");__builtin_unreachable();}'
+  echo 'void page_entry(void){ long s=0; for(int i=0;i<2048;i++) s+=wide[i];'
+  echo '  for(int i=0;i<8192;i++) s+=widebss[i]; s+=chain(0); sys_exit(s%251); }'
+} > t/tmp.pages.c
+build t/pages.o t/tmp.pages.c || exit 1
+
 # --------------------------------------------------------- 1. the kernel runs it
 runs "single object, raw syscall _start" 42 "" t/exit42.o
 
@@ -69,6 +86,14 @@ runs "the same three in reverse order" 42 "hello from lib
 42" t/asm.o t/lib.o t/main.o
 runs "local/weak/strong resolution" 13 "" t/weak.o t/weak2.o
 runs "weak twin seen before the strong one" 13 "" t/weak2.o t/weak.o
+
+# -e names a different entry point, and the default _start is absent entirely.
+if ./lnk -o t/tmp.bin -e page_entry t/pages.o 2> t/tmp.err; then
+  ./t/tmp.bin; rc=$?
+  if [ "$rc" = 174 ]; then ok; else no "-e page_entry: exit status" "expected 174, got $rc"; fi
+else
+  no "-e page_entry: lnk refused" "$(cat t/tmp.err)"
+fi
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]

@@ -754,8 +754,7 @@ static void write_out(const char *path, uint64_t entry, int exec_stack) {
 }
 
 int main(int argc, char **argv) {
-  const char *outpath = "a.out";
-  const char *entry = "_start";
+  const char *outpath = "a.out", *entry = "_start";
   const char *in[256];
   int nin = 0;
 
@@ -763,11 +762,14 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[i], "-o")) {
       if (++i == argc) die("-o needs an argument");
       outpath = argv[i];
+    } else if (!strcmp(argv[i], "-e")) {
+      if (++i == argc) die("-e needs an argument");
+      entry = argv[i];
     } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
       fputs("usage: lnk -o OUT [-e SYM] in1.o in2.o ...\n", stdout);
       return 0;
     } else if (argv[i][0] == '-' && argv[i][1]) {
-      die("unknown option '%s' (lnk takes -o)", argv[i]);
+      die("unknown option '%s' (lnk takes -o and -e)", argv[i]);
     } else {
       if (nin == 256) die("too many input files");
       in[nin++] = argv[i];
@@ -785,7 +787,9 @@ int main(int argc, char **argv) {
 
   Gsym *e = gfind(entry);
   if (!e)
-    die("entry symbol '%s' is not defined in any input", entry);
+    die("entry symbol '%s' is not defined in any input (use -e to name a "
+        "different one)",
+        entry);
   uint64_t entry_addr = gval(e);
 
   int exec_stack = 0;
