@@ -516,7 +516,7 @@ static void resolve_defs(Obj *objs, int nobj) {
       if (ngsym == cgsym) {
         cgsym = cgsym ? cgsym * 2 : 64;
         Gsym *n = xmalloc((size_t)cgsym * sizeof(Gsym));
-        memcpy(n, gsym, (size_t)ngsym * sizeof(Gsym));
+        if (ngsym) memcpy(n, gsym, (size_t)ngsym * sizeof(Gsym));
         gsym = n;
       }
       gsym[ngsym].name = nm;

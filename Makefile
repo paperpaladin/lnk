@@ -6,7 +6,16 @@ lnk: lnk.c
 test: lnk
 	@./t/run.sh
 
-clean:
-	rm -f lnk t/*.o t/tmp* a.out
+# The inputs are untrusted object files, so the parser gets the whole suite run
+# through it under the sanitizers, not just the happy path. Built under a
+# separate name so a sanitizer binary can never be left behind as ./lnk.
+lnk-asan: lnk.c
+	$(CC) $(CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all -o $@ $<
 
-.PHONY: test clean
+test-asan: lnk-asan
+	@LNK=./lnk-asan ./t/run.sh
+
+clean:
+	rm -f lnk lnk-asan t/*.o t/tmp* a.out
+
+.PHONY: test test-asan clean

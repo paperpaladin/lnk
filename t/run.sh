@@ -13,6 +13,9 @@
 # exit status the program itself chose, or whatever ld did.
 cd "$(dirname "$0")/.." || exit 1
 
+# make test-asan points this at the sanitizer build instead.
+LNK="${LNK:-./lnk}"
+
 pass=0
 fail=0
 ok() { pass=$((pass + 1)); }
@@ -30,7 +33,7 @@ build() {
 # --- oracle 1: the kernel runs it, with the exit status and stdout we asked for
 runs() {
   what="$1" wantrc="$2" wantout="$3"; shift 3
-  if ! ./lnk -o t/tmp.bin "$@" 2> t/tmp.err; then
+  if ! "$LNK" -o t/tmp.bin "$@" 2> t/tmp.err; then
     no "$what: lnk refused to link" "$(cat t/tmp.err)"; return
   fi
   ./t/tmp.bin > t/tmp.out 2>/dev/null
@@ -50,7 +53,7 @@ agrees() {
   what="$1"; shift
   entry=""
   case "$1" in -e) entry="-e $2"; shift 2;; esac
-  if ! ./lnk -o t/tmp.a $entry "$@" 2> t/tmp.err; then
+  if ! "$LNK" -o t/tmp.a $entry "$@" 2> t/tmp.err; then
     no "$what vs ld: lnk refused to link" "$(cat t/tmp.err)"; return
   fi
   if ! ld -o t/tmp.b $entry "$@" 2> t/tmp.err; then
@@ -101,7 +104,7 @@ for f in load:
 # --- oracle 4: refused by name, never silently linked to zero
 rejects() {
   what="$1" pat="$2"; shift 2
-  if ./lnk -o t/tmp.bin "$@" > t/tmp.err 2>&1; then
+  if "$LNK" -o t/tmp.bin "$@" > t/tmp.err 2>&1; then
     no "$what: lnk exited 0, but should have refused"; return
   fi
   if ! grep -q "$pat" t/tmp.err; then
@@ -170,7 +173,7 @@ runs "local/weak/strong resolution" 13 "" t/weak.o t/weak2.o
 runs "weak twin seen before the strong one" 13 "" t/weak2.o t/weak.o
 
 # -e names a different entry point, and the default _start is absent entirely.
-if ./lnk -o t/tmp.bin -e page_entry t/pages.o 2> t/tmp.err; then
+if "$LNK" -o t/tmp.bin -e page_entry t/pages.o 2> t/tmp.err; then
   ./t/tmp.bin; rc=$?
   if [ "$rc" = 174 ]; then ok; else no "-e page_entry: exit status" "expected 174, got $rc"; fi
 else
@@ -192,16 +195,16 @@ agrees "single object"        t/exit42.o
 printf 'int tbl[4] __attribute__((aligned(0x800000))) = {1,2,3,4};\nstatic void sys_exit(long c){__asm__ volatile("syscall"::"a"(60L),"D"(c):"memory");__builtin_unreachable();}\nvoid _start(void){ sys_exit(tbl[0]+tbl[3]); }\n' > t/tmp.align.c
 build t/tmp.align.o t/tmp.align.c
 agrees "section aligned past the load base" t/tmp.align.o
-./lnk -o t/tmp.v4 t/tmp.align.o 2>/dev/null
+"$LNK" -o t/tmp.v4 t/tmp.align.o 2>/dev/null
 validates "section aligned past the load base" t/tmp.v4
 
 # ---------------------------------------------------------- 3. readelf and the
 #                                                               layout invariants
-./lnk -o t/tmp.v1 t/main.o t/lib.o t/asm.o 2>/dev/null
+"$LNK" -o t/tmp.v1 t/main.o t/lib.o t/asm.o 2>/dev/null
 validates "three objects" t/tmp.v1
-./lnk -o t/tmp.v2 t/exit42.o 2>/dev/null
+"$LNK" -o t/tmp.v2 t/exit42.o 2>/dev/null
 validates "text-only output (no RW segment at all)" t/tmp.v2
-./lnk -o t/tmp.v3 -e page_entry t/pages.o 2>/dev/null
+"$LNK" -o t/tmp.v3 -e page_entry t/pages.o 2>/dev/null
 validates "multi-page text and data" t/tmp.v3
 
 # .bss must be allocated without occupying file bytes. If p_filesz equals
@@ -231,7 +234,7 @@ rejects "truncated object"                    "lnk:" t/tmp.trunc.o
 
 # The .note.GNU-stack convention: a missing note means the object is asking for
 # an executable stack, and that has to be said out loud.
-if ./lnk -o t/tmp.bin -e nostack_fn t/tmp.nostack.o 2> t/tmp.err &&
+if "$LNK" -o t/tmp.bin -e nostack_fn t/tmp.nostack.o 2> t/tmp.err &&
    grep -q "executable stack" t/tmp.err; then ok
 else no "missing .note.GNU-stack is warned about" "$(cat t/tmp.err)"; fi
 
