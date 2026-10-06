@@ -50,11 +50,23 @@ printf 'int addone(int x){ return x + 1; }\n' > t/tmp.callB.c
 build t/tmp.callA.o t/tmp.callA.c || exit 1
 build t/tmp.callB.o t/tmp.callB.c || exit 1
 
+build t/main.o   t/main.c   || exit 1
+build t/lib.o    t/lib.c    || exit 1
+build t/weak.o   t/weak.c   || exit 1
+build t/weak2.o  t/weak2.c  || exit 1
+
 # --------------------------------------------------------- 1. the kernel runs it
 runs "single object, raw syscall _start" 42 "" t/exit42.o
 
 runs "a call across two objects" 42 "" t/tmp.callA.o t/tmp.callB.o
 runs "the same two in reverse order" 42 "" t/tmp.callB.o t/tmp.callA.o
+
+runs "two objects, cross-object calls and data" 33 "hello from lib
+33" t/main.o t/lib.o
+runs "the same two in reverse order" 33 "hello from lib
+33" t/lib.o t/main.o
+runs "local/weak/strong resolution" 13 "" t/weak.o t/weak2.o
+runs "weak twin seen before the strong one" 13 "" t/weak2.o t/weak.o
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
