@@ -1,0 +1,8 @@
+/lnk
+/lnk-asan
+*.o
+a.out
+t/tmp*
+t/exit42
+t/multi
+t/weak
