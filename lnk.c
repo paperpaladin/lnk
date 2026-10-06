@@ -590,13 +590,17 @@ static void apply_rela(Obj *o, int ri) {
     const char *nm = symname(o, R_SYM(r.r_info));
 
     switch (type) {
-    case R_X86_64_PC32: {
+    case R_X86_64_PC32:
+    case R_X86_64_PLT32: {
       // S + A - P. A call or RIP-relative access encodes the distance from the
       // *end* of the instruction to the target; the assembler puts that -4 (or
       // whatever the trailing-byte count is) into the addend, so the linker
       // just subtracts the address of the field itself. Get the sign of this
       // backwards and every call jumps to roughly twice the wrong distance.
       //
+      // PLT32 is identical to PC32 here: in a static non-PIE link there is no
+      // PLT, so a call that the compiler was willing to route through one just
+      // becomes a direct relative branch to the final address.
       int64_t v = (int64_t)(S + (uint64_t)A - P);
       if (v < INT32_MIN || v > INT32_MAX)
         die("%s: %s against '%s' does not fit in 32 bits (displacement %lld); "
@@ -609,7 +613,7 @@ static void apply_rela(Obj *o, int ri) {
       // Refusing beats emitting a plausible wrong address: a binary that links
       // cleanly and then jumps into nowhere costs far more to debug.
       die("%s: unsupported relocation type %u (%s) against '%s' in '%s'.\n"
-          "       lnk implements R_X86_64_PC32 only. "
+          "       lnk implements R_X86_64_PC32 and R_X86_64_PLT32 only. "
           "GOT/PLT/TLS forms need a dynamic linker's machinery (see PLAN.md); "
           "refusing rather than emitting a wrong address.",
           o->path, type, reloc_name(type), nm, where);

@@ -43,8 +43,18 @@ runs() {
 # ---------------------------------------------------------------------- objects
 build t/exit42.o t/exit42.c || exit 1
 
+# The smallest possible cross-object call, generated rather than checked in:
+# one object calls a function the other defines, and nothing else happens.
+printf 'int addone(int);\nstatic void sys_exit(long c){__asm__ volatile("syscall"::"a"(60L),"D"(c):"memory");__builtin_unreachable();}\nvoid _start(void){ sys_exit(addone(41)); }\n' > t/tmp.callA.c
+printf 'int addone(int x){ return x + 1; }\n' > t/tmp.callB.c
+build t/tmp.callA.o t/tmp.callA.c || exit 1
+build t/tmp.callB.o t/tmp.callB.c || exit 1
+
 # --------------------------------------------------------- 1. the kernel runs it
 runs "single object, raw syscall _start" 42 "" t/exit42.o
+
+runs "a call across two objects" 42 "" t/tmp.callA.o t/tmp.callB.o
+runs "the same two in reverse order" 42 "" t/tmp.callB.o t/tmp.callA.o
 
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
