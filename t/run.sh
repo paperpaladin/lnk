@@ -189,7 +189,7 @@ agrees "multi-page text and data" -e page_entry t/pages.o
 agrees "single object"        t/exit42.o
 
 
-# The regression for commit 02: an alignment larger than the 0x400000 load base
+# The regression for commit 15: an alignment larger than the 0x400000 load base
 # used to break the vaddr/offset congruence and produce a segment header that
 # did not cover its own section. ld gets this right, so ld is the assertion.
 printf 'int tbl[4] __attribute__((aligned(0x800000))) = {1,2,3,4};\nstatic void sys_exit(long c){__asm__ volatile("syscall"::"a"(60L),"D"(c):"memory");__builtin_unreachable();}\nvoid _start(void){ sys_exit(tbl[0]+tbl[3]); }\n' > t/tmp.align.c
