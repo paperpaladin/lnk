@@ -41,7 +41,7 @@ invisible until you get one wrong:
 
 - **`S + A - P`.** A `call` encodes the distance from the end of the instruction
   to its target. The assembler puts the trailing-byte correction into the
-  addend, so the linker computes symbol + addend − *the address of the field it
+  addend, so the linker computes symbol + addend - *the address of the field it
   is writing*. Get the sign backwards and every call lands roughly twice the
   wrong distance away.
 - **`p_vaddr == p_offset (mod PAGE)`.** The kernel maps a segment by `mmap`ing
