@@ -98,27 +98,55 @@ validates() {
     fi
   done
   # Program-header invariants, read back out of the file we just wrote.
-  msg=$(readelf -lW "$f" | python3 -c '
+  # The checker prints OK on success, and its absence is a failure.
+  #
+  # This captured stdout only and tested `[ -n "$msg" ]`, so it was fail-open:
+  # a missing python3, or any exception inside the snippet -- readelf format
+  # drift giving an IndexError, say -- writes to stderr, leaves $msg empty,
+  # and the assertion passed. Replacing python3 with a name that does not
+  # exist produced four "not found" messages and then "29 passed, 0 failed".
+  # This is PLAN oracle 4 and the oracle that caught the only bug this
+  # project records, so it is the last one that should be fail-open. Its
+  # companion .bss check is fail-closed, which is the asymmetry that gave it
+  # away.
+  msg=$(readelf -lW "$f" 2>&1 | python3 -c '
 import sys
 load = [l.split() for l in sys.stdin if l.split()[:1] == ["LOAD"]]
+bad = []
 if not load:
-    print("no LOAD segments")
+    bad.append("no LOAD segments")
 for f in load:
     off, va, fs, ms = (int(f[i], 16) for i in (1, 2, 4, 5))
     if (va - off) % 0x1000:
-        print("vaddr %#x and offset %#x are not congruent mod 0x1000" % (va, off))
+        bad.append("vaddr %#x and offset %#x are not congruent mod 0x1000" % (va, off))
     if fs > ms:
-        print("p_filesz %#x > p_memsz %#x" % (fs, ms))
-')
-  if [ -n "$msg" ]; then no "$what: $msg"; return; fi
+        bad.append("p_filesz %#x > p_memsz %#x" % (fs, ms))
+print("OK" if not bad else "; ".join(bad))
+' 2>&1)
+  if [ "$msg" != OK ]; then no "$what: ${msg:-the layout checker produced nothing}"; return; fi
   ok
 }
 
 # --- oracle 4: refused by name, never silently linked to zero
 rejects() {
   what="$1" pat="$2"; shift 2
-  if "$LNK" -o $T.bin "$@" > $T.err 2>&1; then
+  "$LNK" -o $T.bin "$@" > $T.err 2>&1
+  rc=$?
+  if [ "$rc" -eq 0 ]; then
     no "$what: lnk exited 0, but should have refused"; return
+  fi
+  # Exit 1 exactly, and no sanitizer output. The status was only tested for
+  # being nonzero and nothing ever looked for AddressSanitizer or "runtime
+  # error" in $T.err -- 10 of the 29 assertions are rejects(), so a memory
+  # error in any refusal path could not fail `make test-asan`. Replacing
+  # die()'s exit(1) with a null-pointer store left 29 passed, 0 failed under
+  # both make test and make test-asan, while the binary segfaulted on every
+  # refusal.
+  if grep -qE 'AddressSanitizer|runtime error|LeakSanitizer' $T.err; then
+    no "$what: a sanitizer fired while refusing" "$(head -3 $T.err)"; return
+  fi
+  if [ "$rc" -ne 1 ]; then
+    no "$what: exited $rc, not a clean refusal (1)" "$(head -3 $T.err)"; return
   fi
   if ! grep -q "$pat" $T.err; then
     no "$what: error message does not mention '$pat'" "$(cat $T.err)"; return
@@ -242,7 +270,10 @@ rejects "an executable is not a relocatable object" "not a relocatable object" /
 head -c 300 /dev/urandom > $T.junk.o
 rejects "random bytes"                        "not an ELF file" $T.junk.o
 head -c 120 t/lib.o > $T.trunc.o
-rejects "truncated object"                    "lnk:" $T.trunc.o
+# "truncated or corrupt", not "lnk:": every diagnostic goes through die(),
+# which prefixes "lnk: ", so that pattern matched "cannot open", "not ELF64"
+# and "out of memory" equally -- it asserted only that something was printed.
+rejects "truncated object"                    "truncated or corrupt" $T.trunc.o
 
 # The .note.GNU-stack convention: a missing note means the object is asking for
 # an executable stack, and that has to be said out loud.
