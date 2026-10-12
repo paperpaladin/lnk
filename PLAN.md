@@ -53,9 +53,14 @@ Ranked by how little of it I control:
 5. **Refusal is tested as a feature.** Undefined symbol by name, duplicate
    definition, unsupported relocation type by name, missing entry symbol,
    non-relocatable input, random bytes, truncated object.
-6. `make test-asan` runs the entire suite under `-fsanitize=address,undefined`,
-   plus an out-of-tree mutation fuzzer over the test objects. The inputs are
-   untrusted files; the parser is the attack surface.
+6. `make test-asan` runs the entire suite under `-fsanitize=address,undefined`.
+   The inputs are untrusted files; the parser is the attack surface.
+
+   The mutation fuzzer that used to be listed here is not an oracle this repo
+   has: `make test-asan` is `LNK=./lnk-asan ./t/run.sh` and nothing else, and
+   there is no fuzzer in the tree (`grep -rn 'mutat\|fuzz'` finds two prose
+   lines). It was run out of tree over 5,500 objects, which the README says;
+   that result cannot be reproduced from here and is not part of the suite.
 
 Oracle 3 and 1 together caught the one bug in this project that mattered. Oracle
 6 caught a zero-length `memcpy` from `NULL`.

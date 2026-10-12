@@ -6,7 +6,7 @@ non-PIE executable that the kernel runs.
 
 ```
 $ make
-cc -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -fno-common -o lnk lnk.c
+cc -std=c11 -g -O1 -Wall -Wextra -Wno-unused-parameter -fno-common -ffile-prefix-map=/home/x/projects/lnk=. -o lnk lnk.c
 
 $ gcc -c -fno-pie -O1 -ffreestanding -o t/main.o t/main.c
 $ gcc -c -fno-pie -O1 -ffreestanding -o t/lib.o t/lib.c
@@ -65,10 +65,16 @@ be blamed on glibc's startup path.
 
 Two more oracles sit behind it, both outside my control:
 
-- **`ld` is the reference implementation.** Every multi-object case is linked
-  twice, once with `lnk` and once with the system `ld`, and the two programs must
-  produce identical stdout and identical exit statuses. No hand-computed address
-  appears anywhere in the suite.
+- **`ld` is the reference implementation.** Six cases are linked twice, once
+  with `lnk` and once with the system `ld`, and the two programs must produce
+  identical stdout and identical exit statuses. Three of those six are
+  multi-object. This used to say "every multi-object case", which is not so:
+  nine cases take more than one object file and six of them -- the
+  cross-object call pairs in both orders, the three-object pair in both
+  orders, and the two weak-resolution cases -- go through `runs`, which checks
+  lnk's own output against an expected exit status and stdout rather than
+  against `ld`. No hand-computed address appears anywhere in the suite either
+  way.
 - **`readelf` is the validator.** `readelf -h`, `-l` and `-S` must accept the
   output with nothing on stderr and no `Error` or `Warning` in the text. The
   harness then parses `readelf -lW` back out of the file it just wrote and

@@ -169,7 +169,6 @@ build t/pages.o $T.pages.c || exit 1
 
 # An object with no .note.GNU-stack, to exercise the exec-stack path.
 printf '\t.text\n\t.globl nostack_fn\nnostack_fn:\n\tret\n' > $T.nostack.s
-gcc -c -Wa,--noexecstack -o /dev/null $T.nostack.s 2>/dev/null
 as -o $T.nostack.o $T.nostack.s || no "as $T.nostack.s"
 
 # --------------------------------------------------------- 1. the kernel runs it
