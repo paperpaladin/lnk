@@ -1,11 +1,11 @@
-# lnk -- plan
+# lnk: plan
 
 ## Contract
 
 `lnk -o OUT [-e SYM] in1.o in2.o ...`, a subset of the `ld(1)` interface. The
 real contract is the **ELF64 / System V x86-64 object format and the Linux
 program loader**: read what `gcc -c -fno-pie` produces, and write something
-`execve` accepts. There is no partial credit in either direction -- an object
+`execve` accepts. There is no partial credit in either direction: an object
 file is either parsed as the assembler meant it, or it is not, and a resulting
 executable either runs or the kernel kills it.
 
@@ -13,7 +13,7 @@ Scope today is static, non-PIE, freestanding: no dynamic linker, no libc.
 
 ## Hard invariant
 
-**Every executable lnk emits either runs correctly or was never written.**
+Every executable lnk emits either runs correctly or was never written.
 
 A linker has an unusually cheap way to be useless: emit a plausible wrong
 address. The file links, `readelf` is happy, and then the program dies on the
@@ -30,31 +30,31 @@ guesses:
 - `check_segment()` asserts, immediately before the file is written, that every
   loadable segment satisfies `p_vaddr == p_offset (mod PAGE)` and
   `p_filesz <= p_memsz`. Both mistakes produce a binary that links cleanly and
-  segfaults instantly; one of them actually happened (see commit 15), which is
-  why the check exists rather than a comment saying to be careful.
+  segfaults instantly. One of them actually happened (see commit 15), which is
+  why the check exists, not a comment saying to be careful.
 
 ## Oracle
 
 Ranked by how little of it I control:
 
-1. **The kernel executes the output.** `t/run.sh` links programs from multiple
+1. The kernel executes the output. `t/run.sh` links programs from multiple
    objects and runs them, asserting exit status and stdout. The programs are
    freestanding `_start` with raw syscalls, so a failure cannot be blamed on
    glibc's startup path.
-2. **The system `ld` links the same objects.** Same inputs, two linkers, compare
+2. The system `ld` links the same objects. Same inputs, two linkers, compare
    exit status and stdout. `ld` is the reference implementation and it does not
    care about my reasoning.
-3. **`readelf -h`, `-l`, `-S` accept the output** with nothing on stderr and no
+3. `readelf -h`, `-l`, `-S` accept the output with nothing on stderr and no
    `Error`/`Warning` in the text. It read the over-aligned-section bug out of the
    file before the kernel got a chance to.
-4. **The two layout invariants asserted directly** out of `readelf -lW`, by
+4. The two layout invariants asserted directly out of `readelf -lW`, by
    parsing the headers back out of the file just written: segment congruence, and
    `p_filesz < p_memsz` for the segment containing `.bss`.
-5. **Refusal is tested as a feature.** Undefined symbol by name, duplicate
+5. Refusal is tested as a feature. Undefined symbol by name, duplicate
    definition, unsupported relocation type by name, missing entry symbol,
    non-relocatable input, random bytes, truncated object.
 6. `make test-asan` runs the entire suite under `-fsanitize=address,undefined`.
-   The inputs are untrusted files; the parser is the attack surface.
+   The inputs are untrusted files. The parser is the attack surface.
 
    The mutation fuzzer that used to be listed here is not an oracle this repo
    has: `make test-asan` is `LNK=./lnk-asan ./t/run.sh` and nothing else, and
@@ -77,7 +77,7 @@ Linux. Incremental linking. Debug-info relocation (`.debug_*` is dropped, so
 
 Each entry is one commit: the smallest change that still builds, runs, and moves
 the oracle, with the test that proves it. The relocation types get one commit
-each, because that is the finest honest granularity this project has -- each one is
+each, because that is the finest honest granularity this project has, each one is
 a formula, a range check, and a program that could not be linked before it.
 
 - [x] 01 ELF64 declarations and a bounds-checked reader for relocatable objects
@@ -97,13 +97,13 @@ a formula, a range check, and a program that could not be linked before it.
            system when it is wrong; the process just dies
 - [x] 05 write the ELF header, program headers and a real section header table
       why: first commit that produces a file. Refuses any object with
-           relocations rather than writing one whose every reference is wrong.
+           relocations instead of writing one whose every reference is wrong.
 - [x] 06 the relocation dispatch, refusing every type by name
       why: the default case is the most important branch in the file, so it
            lands before any type that would make it look optional
 - [x] 07 R_X86_64_PC32, and the first binary the kernel runs
       why: S + A - P, and a single-object freestanding program now links
-      proves: `make test` -- 1 case, the kernel executing the output
+      proves: `make test`: 1 case, the kernel executing the output
 - [x] 08 R_X86_64_PLT32, so a call across object files links
       why: in a static non-PIE link there is no PLT, so this is PC32; keeping the
            smallest possible cross-object call as its own case isolates a call
@@ -136,7 +136,7 @@ a formula, a range check, and a program that could not be linked before it.
            wrong, not the linker.
       proves: 27 cases
 - [x] 15 fix segment layout for sections aligned past the load base
-      why: **the first bug that produced a binary the kernel refused to run.**
+      why: the first bug that produced a binary the kernel refused to run.
            `off` and `vaddr` were aligned independently, which keeps them in step
            only for alignments that divide BASE, and the read-write segment
            header was captured before the alignment ran. readelf said "the
@@ -149,10 +149,10 @@ a formula, a range check, and a program that could not be linked before it.
 - [x] 17 docs: README, with the honest "what does not work" list
 - [x] 18 docs: PLAN, with this sequence and what comes next
 
-### Milestone 1 -- link against glibc
+### Milestone 1: link against glibc
 
 The ordering is forced: each item below is a prerequisite for `gcc -c foo.c`
-plus `libc.a` producing a program that runs. Nothing here is speculative -- these
+plus `libc.a` producing a program that runs. Nothing here is speculative: these
 are exactly what `crt1.o` and `libc.a` turned out to need when tried.
 
 - [ ] 04 archive (`.a`) member extraction: the `!<arch>\n` format, the `/` and
@@ -169,7 +169,7 @@ are exactly what `crt1.o` and `libc.a` turned out to need when tried.
 - [ ] 06 `.init_array`/`.fini_array`/`.preinit_array` collection, and the
       `__init_array_start`/`end` linker-defined symbols
       why: glibc's startup walks these, and a missing `__init_array_end` is an
-           undefined-symbol error rather than a mystery
+           undefined-symbol error, not a mystery
 - [ ] 07 the rest of the linker-defined symbols: `_end`, `_edata`, `__bss_start`,
       `__executable_start`
 - [ ] 08 TLS: a `PT_TLS` segment, `.tdata`/`.tbss` layout, and `R_X86_64_TPOFF32`
@@ -180,10 +180,10 @@ are exactly what `crt1.o` and `libc.a` turned out to need when tried.
       expects
       why: `memcpy` and friends are ifuncs; this is the last thing between a
            static glibc link and a running `printf`
-- [ ] 10 **`printf("hello\n")` from a `gcc -c` object plus `libc.a`, running**
+- [ ] 10 `printf("hello\n")` from a `gcc -c` object plus `libc.a`, running
       proves: the headline claim this README currently refuses to make
 
-### Milestone 2 -- dynamic linking
+### Milestone 2: dynamic linking
 
 - [ ] 11 `PT_DYNAMIC`, `.dynsym`, `.dynstr`, `.hash`/`.gnu.hash`, and reading a
       `.so`'s dynamic symbol table instead of its `.symtab`
@@ -194,11 +194,11 @@ are exactly what `crt1.o` and `libc.a` turned out to need when tried.
       why: every distribution defaults to PIE now, so a linker that cannot emit
            one is a linker you cannot use on real input
 
-### Milestone 3 -- the actual point
+### Milestone 3: the actual point
 
 - [ ] 14 `--gc-sections`, so `-ffunction-sections` input stops dragging in
       everything it references transitively
-- [ ] 15 **link `../cc`'s output and drop the `gcc` dependency.** `../cc`
+- [ ] 15 link `../cc`'s output and drop the `gcc` dependency. `../cc`
       currently shells out to `gcc` to assemble and link; once it emits objects
       directly and `lnk` links them, the pair needs neither gcc nor binutils to
       build a working program, and `cc` can be built by `cc` + `lnk` alone.
@@ -220,6 +220,6 @@ are exactly what `crt1.o` and `libc.a` turned out to need when tried.
 - An over-aligned section in the *middle* of a segment is paid for in file
   padding, because `p_vaddr - p_offset` is fixed per segment and changing it
   requires a new segment. A 2MB-aligned `.rodata` produces a 2MB file. Correct,
-  and absurd; marked `shortcut:` rather than fixed, since no real object does it.
+  and absurd. Marked `shortcut:`, not fixed, since no real object does it.
 - No `.symtab` in the output, so `nm` and `gdb` see nothing. Cheap to add and not
-  yet needed by anything; the sanitizers and `ld` comparison have been enough.
+  yet needed by anything. The sanitizers and `ld` comparison have been enough.
