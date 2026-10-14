@@ -68,7 +68,7 @@ Two more oracles sit behind it, both outside my control:
 - `ld` is the reference implementation. Six cases are linked twice, once
   with `lnk` and once with the system `ld`, and the two programs must produce
   identical stdout and identical exit statuses. Three of those six are
-  multi-object. This used to say "every multi-object case", which is not so:
+  multi-object. This used to say "every multi-object case", and that is not so:
   nine cases take more than one object file and six of them: the
   cross-object call pairs in both orders, the three-object pair in both
   orders, and the two weak-resolution cases, go through `runs`, which checks
@@ -104,7 +104,7 @@ headline.
   name, concatenated in input order with each input section's own
   `sh_addralign` honoured. `.text`, `.rodata`, `.rodata.str1.1`, `.data`,
   `.bss`, `.eh_frame` all come through generically. Nothing is special-cased by
-  name. Empty sections are dropped, which is why a text-only program gets one
+  name. Empty sections are dropped, so a text-only program gets one
   segment, not a zero-length second one.
 - Symbols: locals stay local (two objects can each have a different `static`
   function of the same name), globals resolve across objects in either link

@@ -164,7 +164,7 @@ are exactly what `crt1.o` and `libc.a` turned out to need when tried.
       `CODE_4_GOTPCRELX`
       why: `crt1.o` as shipped uses two of these for `main` and `__libc_start_main`.
            Nothing from glibc links without them. In a static link they can also
-           be *relaxed* back into a direct `lea`, which is what `ld` does and what
+           be *relaxed* back into a direct `lea`, as `ld` does and what
            avoids needing a GOT at all for most of them.
 - [ ] 06 `.init_array`/`.fini_array`/`.preinit_array` collection, and the
       `__init_array_start`/`end` linker-defined symbols
@@ -205,7 +205,7 @@ are exactly what `crt1.o` and `libc.a` turned out to need when tried.
       why: this is what the two projects are for. Until it lands, both of them
            are still standing on the toolchain they are trying to replace.
 - [ ] 16 keep binutils in the suite anyway, as the reference. The moment `ld` is
-      no longer *needed*, it becomes purely an oracle, which is the better job
+      no longer *needed*, it becomes purely an oracle, the better job
       for it.
 
 ## Open questions
