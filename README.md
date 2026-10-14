@@ -59,7 +59,7 @@ The second one is the bug that actually happened here. See "Status".
 
 The kernel runs the output or it does not. That is the whole test suite's
 spine: `t/run.sh` links programs from multiple objects and executes them,
-asserting exit status and stdout. The test programs are freestanding: a
+asserting exit status and stdout. The test programs are freestanding. A
 `_start` that makes raw `write` and `exit_group` syscalls, so a failure cannot
 be blamed on glibc's startup path.
 

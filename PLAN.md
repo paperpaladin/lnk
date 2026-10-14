@@ -5,7 +5,7 @@
 `lnk -o OUT [-e SYM] in1.o in2.o ...`, a subset of the `ld(1)` interface. The
 real contract is the **ELF64 / System V x86-64 object format and the Linux
 program loader**: read what `gcc -c -fno-pie` produces, and write something
-`execve` accepts. There is no partial credit in either direction: an object
+`execve` accepts. There is no partial credit in either direction. An object
 file is either parsed as the assembler meant it, or it is not, and a resulting
 executable either runs or the kernel kills it.
 
@@ -152,7 +152,7 @@ a formula, a range check, and a program that could not be linked before it.
 ### Milestone 1: link against glibc
 
 The ordering is forced: each item below is a prerequisite for `gcc -c foo.c`
-plus `libc.a` producing a program that runs. Nothing here is speculative: these
+plus `libc.a` producing a program that runs. Nothing here is speculative. These
 are exactly what `crt1.o` and `libc.a` turned out to need when tried.
 
 - [ ] 04 archive (`.a`) member extraction: the `!<arch>\n` format, the `/` and
