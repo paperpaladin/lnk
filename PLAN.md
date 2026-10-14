@@ -54,7 +54,7 @@ Ranked by how little of it I control:
    definition, unsupported relocation type by name, missing entry symbol,
    non-relocatable input, random bytes, truncated object.
 6. `make test-asan` runs the entire suite under `-fsanitize=address,undefined`.
-   The inputs are untrusted files. The parser is the attack surface.
+   The inputs are untrusted files. Its parser is the attack surface.
 
    The mutation fuzzer that used to be listed here is not an oracle this repo
    has: `make test-asan` is `LNK=./lnk-asan ./t/run.sh` and nothing else, and
