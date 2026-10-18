@@ -155,11 +155,47 @@ The ordering is forced: each item below is a prerequisite for `gcc -c foo.c`
 plus `libc.a` producing a program that runs. Nothing here is speculative. These
 are exactly what `crt1.o` and `libc.a` turned out to need when tried.
 
-- [ ] 04 archive (`.a`) member extraction: the `!<arch>\n` format, the `/` and
+- [x] 04 archive (`.a`) member extraction: the `!<arch>\n` format, the `/` and
       `//` symbol-index and long-name members, and the iterate-to-fixpoint pull
       of only those members that satisfy a still-undefined symbol
       why: `libc.a` is 5,000 members. Linking all of them is not an option, so
            the selection loop is the feature, not the parser.
+      done: and the suite proves it is a loop rather than a pass, which
+           took a second archive to arrange. With the members in the
+           order `ar` happened to write them, one pass is enough:
+           ar_helper is pulled at i=0 and the scan reaches ar_deeper at
+           i=1 having already seen the new reference. A mutation that
+           replaced the loop with a single pass survived everything.
+           The archive with the members in dependency order is the one
+           that needs the fixpoint, and it is in the suite.
+           The symbol index is read but not trusted. ranlib's index can
+           be stale, and a stale one is how a link silently drops a
+           definition the file contains, so every member's own .symtab
+           is consulted instead and an archive built with `ar rc`, which
+           writes no index at all, links identically.
+           A weak undefined reference does not pull a member. That is
+           what weak means, and treating one as a reference links code
+           nobody asked for, which in libc is a great deal of code.
+           A local definition does not satisfy a reference either: it is
+           invisible outside its own object, so pulling on one links a
+           member nobody can call AND stops the real definition being
+           looked for.
+           Nine mutations, all caught. Four of them needed a case
+           constructed first, because the guard was unreachable with any
+           archive `ar` produces here: an odd-sized member (every object
+           gcc emits is even-sized, so the padding rule was never
+           exercised), a size field past the end of the file, a header
+           with its end marker overwritten, and a long-name offset past
+           the end of the `//` member.
+      bug: the one real defect was not in the new code. `copy_sections`,
+           the exec-stack scan and the relocation loop all took `nin`,
+           the number of names on the command line, where they needed
+           the number of objects. One archive supplying two members made
+           those differ for the first time, and the second member's
+           section bytes were never copied: the output held zeros where
+           its code should be and the program jumped into them. No
+           error, no warning, a segfault in a function that was never
+           written. Three loops, two of them silent.
 - [ ] 05 a GOT, and `R_X86_64_GOTPCREL`, `GOTPCRELX`, `REX_GOTPCRELX`,
       `CODE_4_GOTPCRELX`
       why: `crt1.o` as shipped uses two of these for `main` and `__libc_start_main`.

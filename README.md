@@ -19,10 +19,10 @@ $? = 42
 
 ```
 $ make test
-29 passed, 0 failed
+49 passed, 0 failed
 
 $ make test-asan
-29 passed, 0 failed
+49 passed, 0 failed
 ```
 
 ## Why this exists
@@ -187,6 +187,59 @@ fixed per segment, and the file offset is *derived* from the virtual address,
 not computed alongside it. `check_segment()` then asserts the congruence
 and `p_filesz <= p_memsz` immediately before the file is written, so this entire
 class of bug can no longer leave the process as a binary.
+
+## Archives
+
+`lnk -o out main.o libfoo.a` links the members of `libfoo.a` that are
+needed and no others. `--trace-archive` names each one as it is
+pulled.
+
+The selection loop is the feature, not the parser. `libc.a` is five
+thousand members and linking all of them is not an option, so a
+member is taken only to satisfy a reference that is still undefined,
+and taking one can create new references, so it runs to a fixpoint.
+
+That it is a loop rather than a single pass took a second archive to
+demonstrate. With the members in the order `ar` happened to write
+them, one pass is enough: the helper is pulled first and the scan
+reaches the member it depends on afterwards, having already seen the
+new reference. A mutation replacing the loop with one pass survived
+the entire suite. The archive whose members are in dependency order
+is the one that needs the fixpoint, and it is a case now.
+
+Three rules that are easy to get wrong and quiet when wrong:
+
+- **The symbol index is read but not trusted.** `ranlib`'s index can
+  be stale, and a stale index is how a link silently drops a
+  definition the file actually contains. Every member's own `.symtab`
+  is consulted instead, and an archive built with `ar rc`, which
+  writes no index at all, links identically.
+- **A weak undefined reference does not pull a member.** That is what
+  weak means: if nothing supplies the symbol it is zero and the link
+  succeeds. Treating one as a reference links code nobody asked for.
+- **A local definition does not satisfy a reference.** It is invisible
+  outside its own object, so pulling on one links a member nobody can
+  call and stops the real definition being looked for.
+
+Nine mutations, all caught. Four needed a case constructed first,
+because the guard was unreachable with any archive `ar` produces
+here: an odd-sized member (every object gcc emits is even-sized, so
+the padding rule was never exercised), a size field pointing past the
+end of the file, a header with its end marker overwritten, and a
+long-name offset past the end of the `//` member.
+
+### The bug this found, which was not in the new code
+
+`copy_sections`, the executable-stack scan and the relocation loop
+all took `nin`, the number of names on the command line, where they
+needed the number of objects. Nothing had ever made those differ: one
+name was one object. One archive supplying two members made them
+differ for the first time, and the second member's section bytes were
+never copied. The output held zeros where its code should be and the
+program jumped into them. No error, no warning, a segfault inside a
+function whose bytes were never written.
+
+Three loops had it and two of them were silent.
 
 ## Design
 

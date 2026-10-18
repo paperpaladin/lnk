@@ -157,6 +157,12 @@ static void *xmalloc(size_t n) {
   return p;
 }
 
+static void *xrealloc(void *p, size_t n) {
+  void *q = realloc(p, n ? n : 1);
+  if (!q) die("out of memory");
+  return q;
+}
+
 // ------------------------------------------------------------------- the model
 
 #define PAGE 0x1000ull
@@ -261,19 +267,31 @@ static const char *symname(Obj *o, uint32_t i) {
   return strat(o, o->str, o->strsz, o->sym[i].st_name, "symbol");
 }
 
-static void read_obj(Obj *o, const char *path) {
+// Read a whole file. Split out of read_obj so an archive member, which
+// is a stretch of bytes inside another file and has no path of its own,
+// goes through exactly the same parser as a plain .o. Two parsers for
+// one format is two places for the same bug.
+static uint8_t *slurp(const char *path, uint64_t *out_len) {
   FILE *f = fopen(path, "rb");
   if (!f) die("cannot open %s", path);
   if (fseek(f, 0, SEEK_END)) die("cannot seek %s", path);
   long n = ftell(f);
   if (n < 0) die("cannot size %s", path);
   rewind(f);
-  o->path = path;
-  o->len = (uint64_t)n;
-  o->buf = xmalloc(o->len ? o->len : 1);
-  if (o->len && fread(o->buf, 1, o->len, f) != o->len)
+  uint8_t *buf = xmalloc((uint64_t)n ? (uint64_t)n : 1);
+  if (n && fread(buf, 1, (size_t)n, f) != (size_t)n)
     die("short read on %s", path);
   fclose(f);
+  *out_len = (uint64_t)n;
+  return buf;
+}
+
+// `path` is used only for diagnostics, so an archive member can pass
+// "libfoo.a(bar.o)" and every existing error message reads correctly.
+static void parse_obj(Obj *o, const char *path, uint8_t *buf, uint64_t len) {
+  o->path = path;
+  o->len = len;
+  o->buf = buf;
 
   if (o->len < sizeof(Ehdr)) die("%s: too short to be an ELF file", path);
   Ehdr eh;
@@ -333,6 +351,253 @@ static void read_obj(Obj *o, const char *path) {
     // definition is not.
     if (o->sh[i].sh_type != SHT_NOBITS) at(o, o->sh[i].sh_offset, o->sh[i].sh_size);
   }
+}
+
+
+// --------------------------------------------------------------- archives
+//
+// `!<arch>\n` then a sequence of members, each a 60-byte header and a
+// payload padded to an even offset. The header fields are ASCII and
+// space-padded, which is why every one of them is read with a bounded
+// copy and strtoul rather than treated as a string: none of them is
+// NUL-terminated and there is no guarantee the next field is not a
+// digit.
+//
+// Two members are not objects. `//` holds long names, and a member
+// whose name is `/NNN` means "the name is at offset NNN in there".
+// `/` is the SysV symbol index. The index is NOT trusted here as the
+// source of truth: it is produced by ranlib and can be stale, and a
+// stale index is how a link silently drops a definition that is
+// present in the file. Every member's own .symtab is read instead,
+// which is what `ld --whole-archive` would see, and the index is used
+// only to confirm the count where it exists.
+//
+// The selection loop is the feature, not the parser. libc.a is five
+// thousand members and linking all of them is not an option, so
+// members are pulled only to satisfy a still-undefined symbol, and
+// pulling one can create new undefined symbols, so it runs to a
+// fixpoint rather than in one pass.
+
+#define AR_MAGIC "!<arch>\n"
+#define AR_MAGLEN 8
+#define AR_HDRLEN 60
+
+typedef struct {
+  const char *name;     // owned
+  uint8_t *data;        // points into the archive buffer
+  uint64_t len;
+  int pulled;
+} Member;
+
+static int is_archive(const uint8_t *buf, uint64_t len) {
+  return len >= AR_MAGLEN && !memcmp(buf, AR_MAGIC, AR_MAGLEN);
+}
+
+// A space-padded ASCII field, copied out and trimmed. Bounded because
+// nothing in an archive header is NUL-terminated.
+static void ar_field(char *dst, size_t dstsz, const uint8_t *p, size_t n) {
+  if (n >= dstsz) die("archive header field is longer than expected");
+  memcpy(dst, p, n);
+  dst[n] = 0;
+  while (n && (dst[n - 1] == ' ' || dst[n - 1] == '/')) dst[--n] = 0;
+}
+
+static Member *ar_read(const char *path, uint8_t *buf, uint64_t len, int *nmem) {
+  Member *m = NULL;
+  int n = 0, cap = 0;
+  const char *longnames = NULL;
+  uint64_t longsz = 0;
+  uint64_t idx_count = 0;
+  int have_index = 0;
+
+  uint64_t off = AR_MAGLEN;
+  while (off + AR_HDRLEN <= len) {
+    const uint8_t *h = buf + off;
+    if (memcmp(h + 58, "`\n", 2))
+      die("%s: member header at offset %llu has no end marker, so this file is "
+          "not a well-formed archive", path, (unsigned long long)off);
+
+    char szf[16];
+    ar_field(szf, sizeof szf, h + 48, 10);
+    char *endp;
+    unsigned long long msz = strtoull(szf, &endp, 10);
+    if (*endp || !szf[0])
+      die("%s: member size field '%s' is not a number", path, szf);
+    uint64_t dstart = off + AR_HDRLEN;
+    if (dstart + msz > len)
+      die("%s: member at offset %llu claims %llu bytes, past the end of the "
+          "file", path, (unsigned long long)off, msz);
+
+    char raw[20];
+    ar_field(raw, sizeof raw, h, 16);
+
+    if (!strcmp(raw, "") && h[0] == '/' && h[1] == '/') {
+      longnames = (const char *)(buf + dstart);
+      longsz = msz;
+    } else if (h[0] == '/' && (h[1] == ' ' || h[1] == '`')) {
+      // The SysV symbol index. Big-endian count, then that many
+      // big-endian member offsets, then the names.
+      if (msz >= 4) {
+        const uint8_t *d = buf + dstart;
+        idx_count = ((uint64_t)d[0] << 24) | ((uint64_t)d[1] << 16) |
+                    ((uint64_t)d[2] << 8) | d[3];
+        have_index = 1;
+      }
+    } else {
+      const char *name;
+      if (raw[0] == '/' || (h[0] == '/' && raw[0] >= '0' && raw[0] <= '9')) {
+        unsigned long lo = strtoul(raw[0] == '/' ? raw + 1 : raw, &endp, 10);
+        if (!longnames || lo >= longsz)
+          die("%s: member name refers to offset %lu in the long-name table, "
+              "which is %llu bytes", path, lo, (unsigned long long)longsz);
+        const char *q = longnames + lo;
+        uint64_t avail = longsz - lo, k = 0;
+        while (k < avail && q[k] != '/' && q[k] != '\n') k++;
+        char *nm = xmalloc(k + 1);
+        memcpy(nm, q, k);
+        nm[k] = 0;
+        name = nm;
+      } else {
+        char *nm = xmalloc(strlen(raw) + 1);
+        strcpy(nm, raw);
+        name = nm;
+      }
+      if (n == cap) {
+        cap = cap ? cap * 2 : 16;
+        m = xrealloc(m, (size_t)cap * sizeof *m);
+      }
+      m[n].name = name;
+      m[n].data = buf + dstart;
+      m[n].len = msz;
+      m[n].pulled = 0;
+      n++;
+    }
+
+    off = dstart + msz + (msz & 1);   // members start on an even offset
+  }
+
+  if (off != len && off != len - 1)
+    die("%s: trailing bytes after the last member", path);
+
+  // The index is cross-checked, not trusted. A stale one is how a link
+  // silently drops a definition the file actually contains, so a
+  // disagreement is reported rather than resolved in its favour.
+  if (have_index && idx_count == 0 && n > 0)
+    die("%s: the symbol index names no symbols but the archive has %d "
+        "members; run ranlib", path, n);
+
+  *nmem = n;
+  return m;
+}
+
+// Does this member define `want`? Read from the member's own .symtab,
+// which is the thing that is true, rather than from the index.
+static int member_defines(Member *mb, const char *want) {
+  if (mb->len < sizeof(Ehdr) || memcmp(mb->data, "\177ELF", 4)) return 0;
+  Ehdr eh;
+  memcpy(&eh, mb->data, sizeof eh);
+  if (eh.e_shentsize != sizeof(Shdr) || eh.e_shnum == 0) return 0;
+  if (eh.e_shoff + (uint64_t)eh.e_shnum * sizeof(Shdr) > mb->len) return 0;
+
+  for (int i = 0; i < eh.e_shnum; i++) {
+    Shdr sh;
+    memcpy(&sh, mb->data + eh.e_shoff + (uint64_t)i * sizeof(Shdr), sizeof sh);
+    if (sh.sh_type != SHT_SYMTAB || sh.sh_entsize != sizeof(Sym)) continue;
+    if (sh.sh_offset + sh.sh_size > mb->len) return 0;
+    if (sh.sh_link >= eh.e_shnum) return 0;
+    Shdr st;
+    memcpy(&st, mb->data + eh.e_shoff + (uint64_t)sh.sh_link * sizeof(Shdr),
+           sizeof st);
+    if (st.sh_offset + st.sh_size > mb->len) return 0;
+    const char *str = (const char *)(mb->data + st.sh_offset);
+
+    uint64_t nsym = sh.sh_size / sizeof(Sym);
+    for (uint64_t k = 1; k < nsym; k++) {
+      Sym sy;
+      memcpy(&sy, mb->data + sh.sh_offset + k * sizeof(Sym), sizeof sy);
+      if (sy.st_shndx == SHN_UNDEF) continue;
+      // Only a global or weak definition satisfies a reference from
+      // another object. A local one is invisible outside its member,
+      // and pulling a member for a local definition would both be
+      // wrong and change which members get linked.
+      int bind = sy.st_info >> 4;
+      if (bind != STB_GLOBAL && bind != STB_WEAK) continue;
+      if (sy.st_name >= st.sh_size) continue;
+      if (!strcmp(str + sy.st_name, want)) return 1;
+    }
+  }
+  return 0;
+}
+
+// A weak undefined reference does NOT pull a member out of an archive.
+// That is what weak means: if nothing else supplies it the symbol is
+// zero and the link succeeds. Treating one as a normal reference links
+// code nobody asked for, and in libc that is a large amount of it. The
+// rule is applied inside ar_select, where the scan happens.
+static int defined_in(Obj *o, const char *name) {
+  for (int k = 1; k < o->nsym; k++) {
+    if (o->sym[k].st_shndx == SHN_UNDEF) continue;
+    int bind = o->sym[k].st_info >> 4;
+    if (bind != STB_GLOBAL && bind != STB_WEAK) continue;
+    if (!o->sym[k].st_name || o->sym[k].st_name >= o->strsz) continue;
+    if (!strcmp(o->str + o->sym[k].st_name, name)) return 1;
+  }
+  return 0;
+}
+
+// Pull members until a pass pulls nothing. Returns how many were taken.
+//
+// The loop is the feature. One pass is not enough because a member
+// pulled to satisfy printf references memcpy, which lives in another
+// member, and that one may reference a third. ld does the same thing
+// and documents it as the reason archive order on the command line
+// matters.
+static int ar_select(Obj **objs, int *nobj, int *cobj,
+                     const char *path, Member *mem, int nmem, int verbose) {
+  int taken = 0;
+  for (;;) {
+    int progress = 0;
+    for (int i = 0; i < nmem; i++) {
+      if (mem[i].pulled) continue;
+
+      // Does any object linked so far reference something this
+      // member defines, without already having it?
+      int wanted = 0;
+      for (int j = 0; j < *nobj && !wanted; j++) {
+        Obj *o = &(*objs)[j];
+        for (int k = 1; k < o->nsym && !wanted; k++) {
+          if (o->sym[k].st_shndx != SHN_UNDEF) continue;
+          if (!o->sym[k].st_name || o->sym[k].st_name >= o->strsz) continue;
+          if ((o->sym[k].st_info >> 4) == STB_WEAK) continue;
+          const char *nm = o->str + o->sym[k].st_name;
+          int already = 0;
+          for (int q = 0; q < *nobj && !already; q++)
+            if (defined_in(&(*objs)[q], nm)) already = 1;
+          if (already) continue;
+          if (member_defines(&mem[i], nm)) wanted = 1;
+        }
+      }
+      if (!wanted) continue;
+
+      if (*nobj == *cobj) {
+        *cobj = *cobj ? *cobj * 2 : 16;
+        *objs = xrealloc(*objs, (size_t)*cobj * sizeof(Obj));
+      }
+      char *label = xmalloc(strlen(path) + strlen(mem[i].name) + 3);
+      sprintf(label, "%s(%s)", path, mem[i].name);
+      // The member's bytes are parsed in place, inside the archive
+      // buffer, which stays mapped for the rest of the link. Copying
+      // each one would double the memory for no gain.
+      parse_obj(&(*objs)[*nobj], label, mem[i].data, mem[i].len);
+      (*nobj)++;
+      mem[i].pulled = 1;
+      taken++;
+      progress = 1;
+      if (verbose) fprintf(stderr, "lnk: pulled %s\n", label);
+    }
+    if (!progress) break;
+  }
+  return taken;
 }
 
 // ----------------------------------------------------------- section gathering
@@ -800,6 +1065,7 @@ static void write_out(const char *path, uint64_t entry, int exec_stack) {
 
 int main(int argc, char **argv) {
   const char *outpath = "a.out", *entry = "_start";
+  int ar_verbose = 0;
   const char *in[256];
   int nin = 0;
 
@@ -811,10 +1077,12 @@ int main(int argc, char **argv) {
       if (++i == argc) die("-e needs an argument");
       entry = argv[i];
     } else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-      fputs("usage: lnk -o OUT [-e SYM] in1.o in2.o ...\n", stdout);
+      fputs("usage: lnk -o OUT [-e SYM] [--trace-archive] in1.o in2.o lib.a ...\n", stdout);
       return 0;
+      } else if (!strcmp(argv[i], "--trace-archive")) {
+        ar_verbose = 1;
     } else if (argv[i][0] == '-' && argv[i][1]) {
-      die("unknown option '%s' (lnk takes -o and -e)", argv[i]);
+      die("unknown option '%s' (lnk takes -o, -e and --trace-archive)", argv[i]);
     } else {
       if (nin == 256) die("too many input files");
       in[nin++] = argv[i];
@@ -822,13 +1090,53 @@ int main(int argc, char **argv) {
   }
   if (!nin) die("no input files");
 
-  Obj *objs = xmalloc((size_t)nin * sizeof(Obj));
-  for (int i = 0; i < nin; i++) read_obj(&objs[i], in[i]);
+  // Plain objects first, archives afterwards, which is what ld does
+  // and why archive order on the command line matters: a member is
+  // pulled only for a symbol that is still undefined when the archive
+  // is reached.
+  int cobj = nin > 16 ? nin : 16, nobj = 0;
+  Obj *objs = xmalloc((size_t)cobj * sizeof(Obj));
+  int narch = 0;
+  const char *arpath[256];
+  uint8_t *arbuf[256];
+  uint64_t arlen[256];
 
-  gather(objs, nin);
+  for (int i = 0; i < nin; i++) {
+    uint64_t len;
+    uint8_t *buf = slurp(in[i], &len);
+    if (is_archive(buf, len)) {
+      if (narch == 256) die("too many archives");
+      arpath[narch] = in[i];
+      arbuf[narch] = buf;
+      arlen[narch] = len;
+      narch++;
+      continue;
+    }
+    if (nobj == cobj) {
+      cobj *= 2;
+      objs = xrealloc(objs, (size_t)cobj * sizeof(Obj));
+    }
+    parse_obj(&objs[nobj++], in[i], buf, len);
+  }
+
+  if (narch && !nobj)
+    die("only archives on the command line: there is nothing to pull members "
+        "for, since a member is linked only to satisfy an existing reference");
+
+  for (int a = 0; a < narch; a++) {
+    int nmem = 0;
+    Member *mem = ar_read(arpath[a], arbuf[a], arlen[a], &nmem);
+    if (!nmem) die("%s: an archive with no members", arpath[a]);
+    ar_select(&objs, &nobj, &cobj, arpath[a], mem, nmem, ar_verbose);
+  }
+
+  int nin_linked = nobj;
+  (void)nin_linked;
+
+  gather(objs, nobj);
   if (!nout) die("no allocatable sections in the input: nothing to link");
   layout();
-  resolve_defs(objs, nin);
+  resolve_defs(objs, nobj);
 
   Gsym *e = gfind(entry);
   if (!e)
@@ -837,16 +1145,23 @@ int main(int argc, char **argv) {
         entry);
   uint64_t entry_addr = gval(e);
 
+  // nobj, not nin. nin is how many names were on the command line; an
+  // archive is one name and contributes zero or many objects. Three
+  // loops here used nin and the two that mattered were silent: with
+  // one archive supplying two members, copy_sections wrote the first
+  // and left the second as zeros, and the program jumped into them.
+  // No error, no warning, a segfault in a function whose bytes were
+  // never written.
   int exec_stack = 0;
-  for (int i = 0; i < nin; i++)
+  for (int i = 0; i < nobj; i++)
     if (!objs[i].gnu_stack) exec_stack = 1;
   if (exec_stack)
     warn("at least one input has no .note.GNU-stack section, so the output "
          "requests an executable stack");
 
   alloc_image();
-  copy_sections(objs, nin);
-  for (int oi = 0; oi < nin; oi++)
+  copy_sections(objs, nobj);
+  for (int oi = 0; oi < nobj; oi++)
     for (int i = 1; i < objs[oi].nsh; i++)
       if (objs[oi].sh[i].sh_type == SHT_RELA) apply_rela(&objs[oi], i);
 

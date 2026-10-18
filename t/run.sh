@@ -281,5 +281,213 @@ if "$LNK" -o $T.bin -e nostack_fn $T.nostack.o 2> $T.err &&
    grep -q "executable stack" $T.err; then ok
 else no "missing .note.GNU-stack is warned about" "$(cat $T.err)"; fi
 
+# --- archives, against ar, ld and the kernel ------------------------------
+#
+# The selection loop is the feature. An archive of three members where
+# only two are needed, and the second is needed only because the first
+# referenced it, so one pass is not enough.
+if command -v ar >/dev/null 2>&1; then
+	build $T.arm.o t/ar_main.c && build $T.arh.o t/ar_helper.c &&
+	build $T.ard.o t/ar_deeper.c && build $T.aru.o t/ar_unused.c && {
+		rm -f $T.lib.a
+		if ar rcs $T.lib.a $T.arh.o $T.ard.o $T.aru.o 2>$T.err; then
+			runs "an archive member and the member it calls" 22 "" \
+			     $T.arm.o $T.lib.a
+			agrees "archive selection" $T.arm.o $T.lib.a
+
+			# Exactly the two needed members, and not the third.
+			"$LNK" -o $T.sel.bin --trace-archive $T.arm.o $T.lib.a 2>$T.tr
+			got=$(sed -n 's/^lnk: pulled .*(\(.*\))$/\1/p' $T.tr | sort | tr '\n' ' ')
+			want="$(basename $T.ard.o) $(basename $T.arh.o) "
+			if [ "$got" = "$want" ]; then
+				ok
+			else
+				no "only the needed members are pulled" \
+				   "pulled [$got]" "wanted [$want]"
+			fi
+
+			# The transitive one specifically. If the loop ran a
+			# single pass, ar_deeper would be missing and the link
+			# would fail at resolve time rather than here, but the
+			# message would be about an undefined symbol and not
+			# about the loop.
+			if grep -q "$(basename $T.ard.o)" $T.tr; then ok
+			else no "the member pulled BY a pulled member is reached" \
+			        "one pass is not enough and this is the case that says so"; fi
+
+			# And the unneeded one is really in the archive, or the
+			# assertion above passes because there was nothing to
+			# wrongly pull.
+			if ar t $T.lib.a | grep -q "$(basename $T.aru.o)"; then ok
+			else no "the archive actually contains an unneeded member" \
+			        "so 'only the needed members are pulled' proves nothing"; fi
+		else
+			no "ar rcs failed" "$(cat $T.err)"
+		fi
+
+		# Member ORDER is what makes the fixpoint necessary, and the
+		# archive above does not test it: with ar_helper before
+		# ar_deeper, a single pass pulls ar_helper at i=0 and then
+		# sees the new reference in time to pull ar_deeper at i=1.
+		# Reversed, ar_deeper is passed over before anything wants
+		# it, and only a second pass reaches it. A mutation that
+		# replaced the loop with one pass survived everything until
+		# this archive existed.
+		rm -f $T.rev.a
+		if ar rcs $T.rev.a $T.ard.o $T.arh.o $T.aru.o 2>/dev/null; then
+			runs "an archive whose members are in dependency order" 22 "" \
+			     $T.arm.o $T.rev.a
+			"$LNK" -o $T.rv.bin --trace-archive $T.arm.o $T.rev.a 2>$T.tr4
+			if grep -q "$(basename $T.ard.o)" $T.tr4; then ok
+			else no "the second pass reaches a member already passed over" \
+			        "$(cat $T.tr4)"; fi
+		else
+			no "ar rcs in reverse order failed"
+		fi
+
+		# An odd-sized member. Member data is padded to an even
+		# offset, and every object gcc emits here happens to be an
+		# even number of bytes, so the padding rule is never
+		# exercised and a mutation dropping it survives. A
+		# seven-byte text file in front of the objects makes the
+		# next member start one byte later than its size implies.
+		printf 'ODDSIZE' > $T.odd.txt
+		rm -f $T.odd.a
+		if ar rcs $T.odd.a $T.odd.txt $T.arh.o $T.ard.o 2>/dev/null; then
+			runs "an archive with an odd-sized member before the objects" \
+			     22 "" $T.arm.o $T.odd.a
+		else
+			no "ar rcs with an odd-sized member failed"
+		fi
+
+		# No symbol index. ranlib's index can be stale, so lnk reads
+		# each member's own .symtab and must not need the index at
+		# all. `ar rc` without `s` writes none.
+		rm -f $T.noidx.a
+		if ar rc $T.noidx.a $T.arh.o $T.ard.o $T.aru.o 2>/dev/null; then
+			runs "an archive with no symbol index" 22 "" $T.arm.o $T.noidx.a
+		else
+			no "ar rc (no index) failed"
+		fi
+
+		# Long member names, which live in the // member and are
+		# referenced as /offset. Anything over 15 characters.
+		# Under $T so the suite's own cleanup reaches it, and
+		# removed here rather than left for a `rm -f $T.*` that
+		# cannot remove a directory.
+		longdir=$T.longnames
+		rm -rf $longdir
+		mkdir -p $longdir
+		cp $T.arh.o $longdir/a_very_long_member_name_helper.o
+		cp $T.ard.o $longdir/a_very_long_member_name_deeper.o
+		rm -f $T.long.a
+		if ar rcs $T.long.a $longdir/a_very_long_member_name_helper.o \
+		          $longdir/a_very_long_member_name_deeper.o 2>/dev/null; then
+			runs "members with names too long for the header" 22 "" \
+			     $T.arm.o $T.long.a
+			"$LNK" -o $T.ln.bin --trace-archive $T.arm.o $T.long.a 2>$T.tr2
+			if grep -q 'a_very_long_member_name_helper.o' $T.tr2; then ok
+			else no "a long member name is reported in full" "$(cat $T.tr2)"; fi
+		else
+			no "ar rcs with long names failed"
+		fi
+
+		rm -rf $longdir
+
+		# A weak undefined reference does not pull a member.
+		build $T.wm.o t/ar_weak_main.c && build $T.wd.o t/ar_weak_def.c && {
+			rm -f $T.weak.a
+			ar rcs $T.weak.a $T.wd.o 2>/dev/null
+			"$LNK" -o $T.wk.bin --trace-archive $T.wm.o $T.weak.a 2>$T.tr3
+			if [ -s $T.tr3 ]; then
+				no "a weak undefined reference does not pull a member" \
+				   "$(cat $T.tr3)"
+			else
+				ok
+			fi
+			# ld is the reference for what that program then does.
+			agrees "weak reference left unresolved" $T.wm.o $T.weak.a
+		}
+
+		# A LOCAL symbol must not satisfy a reference. One member
+		# has ar_contested as a static, another has it global, and
+		# the static one comes first. Pulling on a local definition
+		# links a member nobody can call and stops the real
+		# definition being looked for.
+		build $T.alo.o t/ar_local.c && build $T.agl.o t/ar_global.c &&
+		build $T.awn.o t/ar_wants.c && {
+			rm -f $T.bind.a
+			ar rcs $T.bind.a $T.alo.o $T.agl.o 2>/dev/null
+			runs "a local definition does not satisfy a reference" 5 "" \
+			     $T.awn.o $T.bind.a
+			"$LNK" -o $T.bd.bin --trace-archive $T.awn.o $T.bind.a 2>$T.tr5
+			if grep -q "$(basename $T.alo.o)" $T.tr5; then
+				no "the member with only a local definition is not pulled" \
+				   "$(cat $T.tr5)"
+			else
+				ok
+			fi
+		}
+
+		# A long-name offset past the end of the // member. No ar
+		# writes one, so the guard is unreachable with any archive
+		# this suite can create and a mutation deleting it survives.
+		# Constructed by hand: the first member header's name field
+		# is overwritten with /9999.
+		if [ -f $T.long.a ]; then
+			cp $T.long.a $T.badname.a
+			printf '/9999          ' | dd of=$T.badname.a bs=1 seek=8 \
+				conv=notrunc status=none 2>/dev/null
+			if "$LNK" -o $T.x.bin $T.arm.o $T.badname.a 2>$T.err; then
+				no "a long-name offset past the table is refused" "it was accepted"
+			elif grep -q 'long-name table' $T.err; then ok
+			else no "a long-name offset past the table is refused" "$(cat $T.err)"; fi
+		fi
+
+		# Refusals. Three shapes, because they reach three different
+		# guards and the obvious one reaches none of them.
+		#
+		# 40 bytes is shorter than the magic plus one header, so the
+		# member loop never runs and this is caught by "an archive
+		# with no members". Both the size check and the end-marker
+		# check survived a mutation until the two cases below
+		# existed.
+		head -c 40 $T.lib.a > $T.trunc.a
+
+		# A complete first header whose size field points past the
+		# end of the file.
+		head -c 78 $T.lib.a > $T.shortmem.a
+		if "$LNK" -o $T.x.bin $T.arm.o $T.shortmem.a 2>$T.err; then
+			no "a member reaching past the end of the file is refused" \
+			   "it was accepted"
+		elif grep -q 'past the end' $T.err; then ok
+		else no "a member reaching past the end of the file is refused" \
+		        "$(cat $T.err)"; fi
+
+		# A header with its two-byte end marker overwritten. Every
+		# other field is intact, so nothing but that check can see
+		# it, and without the check the parser walks off into the
+		# member data treating it as headers.
+		cp $T.lib.a $T.nomark.a
+		printf 'XX' | dd of=$T.nomark.a bs=1 seek=66 conv=notrunc status=none 2>/dev/null
+		if "$LNK" -o $T.x.bin $T.arm.o $T.nomark.a 2>$T.err; then
+			no "a header with no end marker is refused" "it was accepted"
+		elif grep -q 'end marker' $T.err; then ok
+		else no "a header with no end marker is refused" "$(cat $T.err)"; fi
+
+		if "$LNK" -o $T.x.bin $T.arm.o $T.trunc.a 2>$T.err; then
+			no "a truncated archive is refused" "it was accepted"
+		elif [ -s $T.err ]; then ok
+		else no "a truncated archive is refused" "it failed without saying why"; fi
+
+		if "$LNK" -o $T.x.bin $T.lib.a 2>$T.err; then
+			no "an archive with no object to pull for is refused" "it was accepted"
+		elif grep -q 'nothing to pull members for' $T.err; then ok
+		else no "an archive with no object to pull for is refused" "$(cat $T.err)"; fi
+	}
+else
+	printf 'SKIP  ar is not installed, so archives were not tested\n'
+fi
+
 printf '%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" = 0 ]
